@@ -113,10 +113,11 @@ class Mole(gto.Mole):
         self.mass = None # Masses of nuclei
         self.nuclear_basis = 'pb4d' # Name of nuclear basis
         self.mm_mol = None # QMMM support
+        self.mm_mol_pbc = None # QMMM PBC support
         self.positron_charge = None
         self.positron_spin = None
         self._keys.update(['components', '_quantum_nuc', '_n_quantum_nuc',
-                           'mass','nuclear_basis', 'mm_mol',
+                           'mass','nuclear_basis', 'mm_mol', 'mm_mol_pbc',
                            'positron_charge', 'positron_spin'])
 
     # elec and nuc for backward compatibility
@@ -144,7 +145,8 @@ class Mole(gto.Mole):
 
     def build(self, dump_input=DUMPINPUT, parse_arg=ARGPARSE,
               quantum_nuc=None, nuc_basis=None, q_nuc_occ=None,
-              mm_mol=None, positron_charge=None, positron_spin=None, **kwargs):
+              mm_mol=None, mm_mol_pbc=None, positron_charge=None, positron_spin=None,
+              **kwargs):
         '''assign which nuclei are treated quantum mechanically by quantum_nuc (list)
 
         Args:
@@ -156,6 +158,8 @@ class Mole(gto.Mole):
                 Fractional occupations for quantum nuclei
             mm_mol : Mole
                 MM molecule for QM/MM
+            mm_mol_pbc : Mole
+                MM molecule for QM/MM PBC, should be created by pyscf.qmmm.pbc.mm_mole.create_mm_mol
             positron_charge : int
                 Charge for positron component
             positron_spin : int
@@ -190,6 +194,10 @@ class Mole(gto.Mole):
         # QMMM mm mole from pyscf.qmmm.mm_mole.create_mm_mol
         if mm_mol is not None:
             self.mm_mol = mm_mol
+
+        # QMMM mm mole from pyscf.qmmm.pbc.mm_mole.create_mm_mol
+        if mm_mol_pbc is not None:
+            self.mm_mol_pbc = mm_mol_pbc
 
         # Handle positron parameters
         # NOTE: positron_charge should be understood as, with nuclei and
@@ -249,10 +257,7 @@ class Mole(gto.Mole):
         for i in range(self.natm):
             if self._quantum_nuc[i]:
                 modified_symbol = self.atom_symbol(i) + str(i)
-                if self.atom_symbol(i) in _basis_bak:
-                    self._basis[modified_symbol] = cp.deepcopy(_basis_bak[self.atom_symbol(i)])
-                else:
-                    self._basis[modified_symbol] = cp.deepcopy(_basis_bak[self.atom_pure_symbol(i)])
+                self._basis[modified_symbol] = cp.deepcopy(_basis_bak[self.atom_symbol(i)])
                 self._basis[modified_symbol].append(self.mass[i].item())
                 n_mol = self.components[f'n{i}']
                 self._basis[modified_symbol].append(n_mol._basis[modified_symbol])
