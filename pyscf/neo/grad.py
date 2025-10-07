@@ -1149,8 +1149,10 @@ class Gradients(rhf_grad.GradientsBase):
         temp = lib.einsum('ig,gx->ix', cosGvRqm, temp)
         qm_ewg_grad -= lib.einsum('i,ix->ix', qm_charges, temp) / 3
         #p = ['einsum_path', (4, 6), (1, 5), (1, 2), (2, 3), (1, 2), (0, 1)]
-        #qm_ewg_grad += cp.einsum('jab,ga,gb,gx,g,jg,g->jx', qm_quads, Gv, Gv, Gv, zcosGvRqm, sinGvRqm, Gpref, optimize=p) / 3
-        #qm_ewg_grad -= cp.einsum('jab,ga,gb,gx,g,jg,g->jx', qm_quads, Gv, Gv, Gv, zsinGvRqm, cosGvRqm, Gpref, optimize=p) / 3
+        #qm_ewg_grad += cp.einsum('jab,ga,gb,gx,g,jg,g->jx',\
+        # qm_quads, Gv, Gv, Gv, zcosGvRqm, sinGvRqm, Gpref, optimize=p) / 3
+        #qm_ewg_grad -= cp.einsum('jab,ga,gb,gx,g,jg,g->jx',\
+        # qm_quads, Gv, Gv, Gv, zsinGvRqm, cosGvRqm, Gpref, optimize=p) / 3
         temp = lib.einsum('g,g->g', zcosGvRqm, Gpref)
         temp = lib.einsum('ga,g->ag', Gv, temp)
         temp2 = lib.einsum('gb,gx->bgx', Gv, Gv)
