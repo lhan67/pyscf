@@ -40,7 +40,7 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
         self.a = a
         if rcut_ewald is None:
             rcut_ewald = min(np.diag(a)) * 0.5
-            logger.warn(self, "Setting rcut_ewald to be half  box size")
+            logger.warn(self, "Setting rcut_ewald to be half box size")
         if rcut_hcore is None:
             rcut_hcore = np.linalg.norm(np.diag(a)) / 2
             logger.warn(self, "Setting rcut_hcore to be half box diagonal")

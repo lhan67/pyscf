@@ -266,7 +266,7 @@ def hcore_qmmm_pbc(mol, mm_mol_pbc):
             v = lib.unpack_tril(v)
     elif mm_mol_pbc.charge_model == 'point' and len(coords) != 0:
         for i0, i1 in lib.prange(0, charges.size, blksize):
-            j3c = mol.intor('int1e_grids', hermi=1, grids=coords[i0:i1].get())
+            j3c = mol.intor('int1e_grids', hermi=1, grids=coords[i0:i1])
             v += lib.einsum('kpq,k->pq', j3c, -charges[i0:i1])
     else: # no MM charges
         pass
@@ -1497,7 +1497,11 @@ class HF(scf.hf.SCF):
             all_coords = lib.direct_sum('ix+Lx->Lix',
                 mm_mol.atom_coords(), Ls).reshape(-1,3)
             all_charges = numpy.hstack([mm_mol.atom_charges()] * len(Ls))
-            all_expnts = numpy.hstack([numpy.sqrt(mm_mol.get_zetas())] * len(Ls))
+            zetas = mm_mol.get_zetas()
+            if self.mol.mm_mol_pbc.charge_model == 'gaussian':
+                all_expnts = numpy.hstack([numpy.sqrt(zetas)] * len(Ls))
+            else:
+                all_expnts = numpy.full(len(mm_mol.atom_coords()) * len(Ls), numpy.sqrt(zetas))
             dist2 = all_coords - qm_center
             dist2 = lib.einsum('ix,ix->i', dist2, dist2)
             mask = dist2 <= mm_mol.rcut_hcore**2
@@ -1745,7 +1749,9 @@ class HF(scf.hf.SCF):
             qm_quadrupoles += comp.get_qm_quadrupoles(dm[t])
         return qm_quadrupoles
 
-    def get_qm_ewald_pot(self, mol, dm, qm_ewald_hess=None):
+    def get_qm_ewald_pot(self, mol=None, dm=None, qm_ewald_hess=None):
+        if mol is None:
+            mol = self.mol
         if qm_ewald_hess is None:
             qm_ewald_hess = mol.mm_mol_pbc.get_ewald_pot(mol.atom_coords())
             self.qm_ewald_hess = qm_ewald_hess
@@ -1760,7 +1766,9 @@ class HF(scf.hf.SCF):
         ewpot2  = numpy.einsum('ijxy,j->ixy', qm_ewald_hess[3], charges)
         return ewpot0, ewpot1, ewpot2
 
-    def get_mm_ewald_pot(self, mol, mm_mol):
+    def get_mm_ewald_pot(self, mol=None, mm_mol=None):
+        if mol is None:
+            mol = self.mol
         return mol.mm_mol_pbc.get_ewald_pot(
             mol.atom_coords(),
             mm_mol.atom_coords(), mm_mol.atom_charges())

@@ -114,7 +114,7 @@ class ComponentGrad:
                                            comp=3, cintopt=cintopt)
                     v += numpy.einsum('ipqk,k->ipq', j3c, charges[i0:i1])
             elif mm_mol.charge_model == 'point' and len(coords) != 0:
-                raise RuntimeError("Not tested yet")
+                # raise RuntimeError("Not tested yet")
                 max_memory = mol.super_mol.max_memory - lib.current_memory()[0]
                 blksize = int(min(max_memory*1e6/8/nao**2/3, 200))
                 blksize = max(blksize, 1)
@@ -414,7 +414,10 @@ def grad_hcore_mm_pbc(mf_grad, dm=None, mol=None):
     qm_center = numpy.mean(mol.atom_coords(), axis=0)
     all_coords = (coords[None,:,:] + Ls[:,None,:]).reshape(-1,3)
     all_charges = numpy.hstack([charges] * len(Ls))
-    all_expnts = numpy.hstack([expnts] * len(Ls))
+    if mol.mm_mol_pbc.charge_model == 'gaussian':
+        all_expnts = numpy.hstack([expnts] * len(Ls))
+    else:
+        all_expnts = numpy.full(len(mm_mol.atom_coords()) * len(Ls), expnts)
     dist2 = all_coords - qm_center
     dist2 = numpy.einsum('ix,ix->i', dist2, dist2)
 
@@ -491,7 +494,11 @@ def grad_nuc_mm_pbc(mf_grad, mol=None):
     all_coords = lib.direct_sum('ix+Lx->Lix',
             mm_mol.atom_coords(), Ls).reshape(-1,3)
     all_charges = numpy.hstack([mm_mol.atom_charges()] * len(Ls))
-    all_expnts = numpy.hstack([numpy.sqrt(mm_mol.get_zetas())] * len(Ls))
+    zetas = mm_mol.get_zetas()
+    if mol.mm_mol_pbc.charge_model == 'gaussian':
+        all_expnts = numpy.hstack([numpy.sqrt(zetas)] * len(Ls))
+    else:
+        all_expnts = numpy.full(len(mm_mol.atom_coords()) * len(Ls), numpy.sqrt(zetas))
     dist2 = all_coords - qm_center
     dist2 = lib.einsum('ix,ix->i', dist2, dist2)
     mask = dist2 <= mm_mol.rcut_hcore**2
@@ -642,8 +649,11 @@ class Gradients(rhf_grad.GradientsBase):
             qm_center = numpy.mean(mol.atom_coords(), axis=0)
             all_coords = (coords[None, :, :] + Ls[:, None, :]).reshape(-1, 3)
             all_charges = numpy.hstack([charges] * len(Ls))
-            all_expnts = numpy.hstack([numpy.sqrt(mm_mol.get_zetas())]
-                                     * len(Ls))
+            zetas = mm_mol.get_zetas()
+            if mol.mm_mol_pbc.charge_model == 'gaussian':
+                all_expnts = numpy.hstack([numpy.sqrt(zetas)] * len(Ls))
+            else:
+                all_expnts = numpy.full(len(mm_mol.atom_coords()) * len(Ls), numpy.sqrt(zetas))
             dist2 = all_coords - qm_center
             dist2 = numpy.einsum('ix,ix->i', dist2, dist2)
             mask = dist2 <= mm_mol.rcut_hcore**2
@@ -699,7 +709,6 @@ class Gradients(rhf_grad.GradientsBase):
 
         # Add inter-component interaction gradient
         de += self.grad_int(mo_energy, mo_coeff, mo_occ, atmlst)
-
         # Add EPC contribution if needed
         if hasattr(self.base, 'epc') and self.base.epc is not None:
             de += self.grad_epc(mo_energy, mo_coeff, mo_occ, atmlst)
@@ -852,10 +861,7 @@ class Gradients(rhf_grad.GradientsBase):
             mm_ewovrl_grad = numpy.zeros_like(all_mm_coords)
         max_memory = mol.max_memory - lib.current_memory()[0]
         nao = mol.nao
-        print(f"mem_avail = {max_memory}")
-        print(f"len(all_mm_coords) = {len(all_mm_coords)}")
         blksize = int(min(max_memory*1e6/8/nao**2/3, 200))
-        print(f"blksize = {blksize}")
         if blksize == 0:
             raise RuntimeError(f"Not enough memory, max_memory = {max_memory}, blkszie = {blksize}")
         for i0, i1 in lib.prange(0, mol.natm, blksize):
@@ -879,7 +885,10 @@ class Gradients(rhf_grad.GradientsBase):
             max_ewrcut = pbc.gto.cell._estimate_rcut(min_expnt, 0, 1., cell.precision)
             cut2 = (max_ewrcut + rmax_qm)**2
             mask = mask & (dist2 <= cut2)
-            expnts = numpy.hstack([numpy.sqrt(zetas)] * len(Lall))[mask]
+            if mol.mm_mol_pbc.charge_model == 'gaussian':
+                expnts = numpy.hstack([numpy.sqrt(zetas)] * len(Lall))[mask]
+            else:
+                expnts = numpy.full(len(cell.atom_coords()) * len(Lall), numpy.sqrt(zetas))[mask]
             if expnts.size != 0:
                 Tija, Tijab, Tijabc = grad_kTij(R[:,mask], r[:,mask], expnts)
                 qm_ewovrl_grad[i0:i1] -= grad_qm_multipole(Tija, Tijab, Tijabc,
