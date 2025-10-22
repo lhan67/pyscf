@@ -70,6 +70,8 @@ def add_mm_charges(scf_method, atoms_or_coords, a, charges, radii=None,
             rcut_ewald=rcut_ewald, rcut_hcore=rcut_hcore, unit=unit)
     return qmmm_for_scf(scf_method, mm_mol)
 
+mm_charge = add_mm_charges
+
 def qmmm_for_scf(scf_method, mm_mol):
     assert isinstance(scf_method, scf.hf.SCF)
 

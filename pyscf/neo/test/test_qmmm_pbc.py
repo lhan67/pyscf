@@ -17,9 +17,9 @@ def setUpModule():
     mm_radii = [0.8,1.2]
     rcut_ewald = 8
     rcut_hcore = 6
-    mm_mol_pbc = mm_mole.create_mm_mol(mm_coords, box, mm_charges, mm_radii, rcut_ewald, rcut_hcore)
+    mm_mol_pbc = mm_mole.create_mm_mol(mm_coords, box, mm_charges, mm_radii, rcut_ewald=rcut_ewald, rcut_hcore=rcut_hcore)
     mm_mol_point = mm_mole.create_mm_mol(mm_coords, box, mm_charges, rcut_ewald=rcut_ewald, rcut_hcore=rcut_hcore)
-    mm_mol_small_radius = mm_mole.create_mm_mol(mm_coords, box, mm_charges, [1e-8]*2, rcut_ewald, rcut_hcore)
+    mm_mol_small_radius = mm_mole.create_mm_mol(mm_coords, box, mm_charges, [1e-8]*2, rcut_ewald=rcut_ewald, rcut_hcore=rcut_hcore)
     atom='''
          O       0.0000000000    -0.0000000000     0.1174000000
          H      -0.7570000000    -0.0000000000    -0.4696000000
