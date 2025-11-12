@@ -215,9 +215,9 @@ def qmmm_for_scf(scf_method, mm_mol):
                 cput0 = (logger.process_clock(), logger.perf_counter())
                 self.s1r = list()
                 mol = self.mol
-                bas_atom = mol._bas[:,gto.ATOM_OF]
+                aoslices = self.mol.aoslice_by_atom()
                 for i in range(self.mol.natm):
-                    b0, b1 = np.where(bas_atom == i)[0][[0,-1]]
+                    b0, b1 = aoslices[i, :2][0], aoslices[i, :2][1]-1
                     shls_slice = (0, mol.nbas, b0, b1+1)
                     with mol.with_common_orig(mol.atom_coord(i)):
                         self.s1r.append(
@@ -245,9 +245,9 @@ def qmmm_for_scf(scf_method, mm_mol):
                 self.s1rr = list()
                 mol = self.mol
                 nao = mol.nao
-                bas_atom = mol._bas[:,gto.ATOM_OF]
+                aoslices = self.mol.aoslice_by_atom()
                 for i in range(self.mol.natm):
-                    b0, b1 = np.where(bas_atom == i)[0][[0,-1]]
+                    b0, b1 = aoslices[i, :2][0], aoslices[i, :2][1]-1
                     shls_slice = (0, mol.nbas, b0, b1+1)
                     with mol.with_common_orig(mol.atom_coord(i)):
                         s1rr_ = mol.intor('int1e_rr', shls_slice=shls_slice)
