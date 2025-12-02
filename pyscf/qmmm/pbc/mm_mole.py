@@ -1,4 +1,21 @@
-import numpy
+#!/usr/bin/env python
+# Copyright 2025 The PySCF Developers. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Author: Chenghan Li <lch004218@gmail.com>
+#
+
 import numpy as np
 from pyscf import gto
 from pyscf import pbc
@@ -6,12 +23,11 @@ from pyscf import qmmm
 from pyscf.gto.mole import is_au
 from pyscf.data.elements import charge
 from pyscf.lib import param, logger
-# from pyscf.pbc.gto.cell import _cut_mesh_for_ewald
 from scipy.special import erf, erfc, lambertw
 from pyscf import lib
 
 class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
-    '''Cell class for MM particles.
+    r''':class:`Cell` class for MM particles.
 
     Args:
         atoms : geometry of MM particles (unit Bohr).
@@ -26,12 +42,11 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
             fractional charges of MM particles
         zeta : 1D array
             Gaussian charge distribution parameter.
-            rho(r) = charge * Norm * exp(-zeta * r^2)
+            :math:`rho(r) = charge * Norm * exp(-\zeta * r^2)`
 
     '''
     def __init__(self, atoms, a,
-            rcut_ewald=None, rcut_hcore=None,
-            charges=None, zeta=None):
+                 rcut_ewald=None, rcut_hcore=None, charges=None, zeta=None):
         pbc.gto.Cell.__init__(self)
         self.atom = self._atom = atoms
         self.unit = 'Bohr'
@@ -39,10 +54,10 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
         assert np.linalg.norm(a - np.diag(np.diag(a))) < 1e-12
         self.a = a
         if rcut_ewald is None:
-            rcut_ewald = min(np.diag(a)) * 0.5
+            rcut_ewald = min(np.diag(a)) * .5
             logger.warn(self, "Setting rcut_ewald to be half box size")
         if rcut_hcore is None:
-            rcut_hcore = np.linalg.norm(np.diag(a)) / 2
+            rcut_hcore = np.linalg.norm(np.diag(a)) * .5
             logger.warn(self, "Setting rcut_hcore to be half box diagonal")
         # rcut_ewald has to be < box size cuz my get_lattice_Ls only considers nearest cell
         assert rcut_ewald < min(np.diag(a)), "Only rcut_ewald < box size implemented"
@@ -52,26 +67,26 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
         # Initialize ._atm and ._env to save the coordinates and charges and
         # other info of MM particles
         natm = len(atoms)
-        _atm = numpy.zeros((natm,6), dtype=numpy.int32)
+        _atm = np.zeros((natm,6), dtype=np.int32)
         _atm[:,gto.CHARGE_OF] = [charge(a[0]) for a in atoms]
-        coords = numpy.asarray([a[1] for a in atoms], dtype=numpy.double)
+        coords = np.asarray([a[1] for a in atoms], dtype=np.float64)
         if charges is None:
             _atm[:,gto.NUC_MOD_OF] = gto.NUC_POINT
             charges = _atm[:,gto.CHARGE_OF:gto.CHARGE_OF+1]
         else:
             _atm[:,gto.NUC_MOD_OF] = gto.NUC_FRAC_CHARGE
-            charges = numpy.asarray(charges)[:,numpy.newaxis]
+            charges = np.asarray(charges)[:,np.newaxis]
 
-        self._env = numpy.append(numpy.zeros(gto.PTR_ENV_START),
-                                 numpy.hstack((coords, charges)).ravel())
-        _atm[:,gto.PTR_COORD] = gto.PTR_ENV_START + numpy.arange(natm) * 4
-        _atm[:,gto.PTR_FRAC_CHARGE] = gto.PTR_ENV_START + numpy.arange(natm) * 4 + 3
+        self._env = np.append(np.zeros(gto.PTR_ENV_START),
+                              np.hstack((coords, charges)).ravel())
+        _atm[:,gto.PTR_COORD] = gto.PTR_ENV_START + np.arange(natm) * 4
+        _atm[:,gto.PTR_FRAC_CHARGE] = gto.PTR_ENV_START + np.arange(natm) * 4 + 3
 
         if zeta is not None:
             self.charge_model = 'gaussian'
-            zeta = numpy.asarray(zeta, dtype=float).ravel()
-            self._env = numpy.append(self._env, zeta)
-            _atm[:,gto.PTR_ZETA] = gto.PTR_ENV_START + natm*4 + numpy.arange(natm)
+            zeta = np.asarray(zeta, dtype=np.float64).ravel()
+            self._env = np.append(self._env, zeta)
+            _atm[:,gto.PTR_ZETA] = gto.PTR_ENV_START + natm*4 + np.arange(natm)
 
         self._atm = _atm
 
@@ -79,7 +94,8 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
         e = self.precision
         Q = np.sum(self.atom_charges()**2)
         L = self.vol**(1/3)
-        kmax = np.sqrt(3)*eta/2/np.pi * np.sqrt(lambertw( 4*Q**(2/3)/3/np.pi**(2/3)/L**2/eta**(2/3) / e**(4/3) ).real)
+        kmax = (np.sqrt(3) * eta / (2*np.pi) *
+                np.sqrt(lambertw(4*Q**(2/3)/3/np.pi**(2/3)/L**2/eta**(2/3) / e**(4/3)).real))
         self.mesh = np.ceil(np.diag(self.lattice_vectors()) * kmax).astype(int) * 2 + 1
 
         self._built = True
@@ -105,7 +121,6 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
 
     def get_ewald_pot(self, coords1, coords2=None, charges2=None):
         assert self.dimension == 3
-        assert (coords2 is None and charges2 is None) or (coords2 is not None and charges2 is not None)
 
         if charges2 is not None:
             assert len(charges2) == len(coords2)
@@ -316,13 +331,13 @@ class Cell(qmmm.mm_mole.Mole, pbc.gto.Cell):
         if charges2 is not None:
             return ewovrl0 + ewg0, ewovrl1 + ewg1, ewovrl2 + ewg2
         else:
-            return ewovrl00 + ewself00 + ewg00, \
-                   ewovrl01 + ewself01 + ewg01, \
-                   ewovrl11 + ewself11 + ewg11, \
-                   ewovrl02 + ewself02 + ewg02
+            return (ewovrl00 + ewself00 + ewg00,
+                    ewovrl01 + ewself01 + ewg01,
+                    ewovrl11 + ewself11 + ewg11,
+                    ewovrl02 + ewself02 + ewg02,)
 
 def create_mm_mol(atoms_or_coords, a, charges=None, radii=None,
-        rcut_ewald=None, rcut_hcore=None, unit='Angstrom'):
+                  rcut_ewald=None, rcut_hcore=None, unit='Angstrom'):
     '''Create an MM object based on the given coordinates and charges of MM
     particles.
 
@@ -342,7 +357,7 @@ def create_mm_mol(atoms_or_coords, a, charges=None, radii=None,
         unit : string
             The unit of the input. Default is 'Angstrom'.
     '''
-    if isinstance(atoms_or_coords, numpy.ndarray):
+    if isinstance(atoms_or_coords, np.ndarray):
         # atoms_or_coords == np.array([(xx, xx, xx)])
         # Patch ghost atoms
         atoms = [(0, c) for c in atoms_or_coords]
@@ -359,7 +374,7 @@ def create_mm_mol(atoms_or_coords, a, charges=None, radii=None,
     if radii is None:
         zeta = None
     else:
-        radii = numpy.asarray(radii, dtype=float).ravel()
+        radii = np.asarray(radii, dtype=float).ravel()
         if not is_au(unit):
             radii = radii / param.BOHR
         zeta = 1 / radii**2

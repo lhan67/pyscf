@@ -1849,8 +1849,9 @@ class HF(scf.hf.SCF):
                     if t.startswith('p'):
                         charge = -1.
                     self.components[t] = general_scf(mf, charge=charge)
-            self.interactions = generate_interactions(self.components, InteractionCoulomb,
-                                                      self.max_memory)
+            self.interactions.clear()
+            self.interactions.update(generate_interactions(self.components, InteractionCoulomb,
+                                                           self.max_memory))
 
         return self
 
