@@ -186,9 +186,21 @@ def energy_octupole(coords1, coords2, octupoles, charges):
     ene = 0.0
     for i0, i1 in lib.prange(0, len(coords1), blksize):
         Rij = coords1[i0:i1,None,:] - coords2[None,:,:]
+        Rij = np.where(cp.abs(Rij) < 1e-14, 1e100, Rij)
         Tijabc = get_multipole_tensors_pp(Rij, [3])[0]
         vj = contract('ijabc,iabc->j', Tijabc, octupoles[i0:i1])
         ene += np.dot(vj, charges) / 6.0
+    return float(ene)
+
+def energy_octupole_2(coords1, coords2, dipoles, quadrupoles):
+    blksize = max(1, min(len(coords1), 256))
+    ene = 0.0
+    for i0, i1 in lib.prange(0, len(coords1), blksize):
+        Rij = coords1[i0:i1,None,:] - coords2[None,:,:]
+        Rij = np.where(cp.abs(Rij) < 1e-14, 1e100, Rij)
+        Tijabc = get_multipole_tensors_pp(Rij, [3])[0]
+        vj = contract('ijabc,ia,jbc->', Tijabc, dipoles[i0:i1], quadrupoles)
+        ene += vj / 6.0
     return float(ene)
 
 def loop_icell(i, a):
@@ -210,7 +222,7 @@ def loop_icell(i, a):
                 for nz in [-i, i]:
                     yield np.dot(np.asarray([nx, ny, nz]), a)
 
-def estimate_error(mol, mm_coords, a, mm_charges, rcut_hcore, dm, precision=1e-8, unit='angstrom'):
+def estimate_error(mol, mm_coords, a, mm_charges, rcut_hcore, dm, precision=1e-8, unit='angstrom', mf=None):
     qm_octupoles = get_qm_octupoles(mol, dm)
 
     a = np.asarray(a)
@@ -225,21 +237,25 @@ def estimate_error(mol, mm_coords, a, mm_charges, rcut_hcore, dm, precision=1e-8
     qm_cen = np.mean(qm_coords, axis=0)
 
     err_tot = 0
-    icell = 0
+    icell = 1
     while True:
         err_icell = 0
         for shift in loop_icell(icell, a):
             coords2 = mm_coords + shift
             dist2 = coords2 - qm_cen
             dist2 = contract('ix,ix->i', dist2, dist2)
-            mask = dist2 > rcut_hcore**2
-            coords2 = coords2[mask]
+            # mask = dist2 > rcut_hcore**2
+            # coords2 = coords2[mask]
             if coords2.size != 0:
-                err_icell += energy_octupole(qm_coords, coords2, qm_octupoles, mm_charges[mask])
+                err_icell += energy_octupole(qm_coords, coords2, qm_octupoles, mm_charges)
+                err_icell += energy_octupole_2(qm_coords, coords2, mf.get_qm_dipoles(dm), 2/3*mf.get_qm_quadrupoles(dm))
         err_tot += err_icell
         if abs(err_icell) < precision and icell > 0:
             break
         icell += 1
+        if icell > 20:
+            break
+        print(f'icell = {icell}, err_tot = {err_tot}')
     return err_tot
 
 def determine_hcore_cutoff(mol, mm_coords, a, mm_charges, rcut_min, dm,
