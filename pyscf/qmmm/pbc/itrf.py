@@ -80,7 +80,7 @@ def add_mm_charges(scf_method, atoms_or_coords, a, charges, radii=None,
     mm_mol = mm_mole.create_mm_mol(atoms_or_coords, a, charges, radii=radii,
             rcut_ewald=rcut_ewald, rcut_hcore=rcut_hcore, unit=unit)
     mf = qmmm_for_scf(scf_method, mm_mol)
-    if pop_method == None:
+    if pop_method is None:
         mf.pop_method = 'mulliken'
     else:
         mf.pop_method = pop_method.lower()
@@ -247,7 +247,7 @@ class QMMMSCF(QMMM):
         CO_orth = AO_orth^{-1}
         \tilde{P} = CO_orth @ P @ CO_orth.T
         '''
-        if pop_method == None:
+        if pop_method is None:
             pop_method = self.pop_method
         if pop_method == 'mulliken':
             return np.eye(self.mol.nao), np.eye(self.mol.nao)
@@ -266,7 +266,7 @@ class QMMMSCF(QMMM):
         r'''
         \tilde{S} = AO_orth.T @ S @ AO_orth
         '''
-        if pop_method == None:
+        if pop_method is None:
             pop_method = self.pop_method
         if pop_method == 'mulliken':
             return self.get_ovlp()
@@ -281,7 +281,7 @@ class QMMMSCF(QMMM):
         r'''
         \tilde{P} = CO_orth @ P @ CO_orth.T
         '''
-        if pop_method == None:
+        if pop_method is None:
             pop_method = self.pop_method
         if pop_method == 'mulliken':
             return dm
@@ -290,7 +290,7 @@ class QMMMSCF(QMMM):
             return reduce(lib.dot, (CO_orth, dm, CO_orth.T))
 
     def get_qm_charges(self, dm, pop_method=None):
-        if pop_method == None:
+        if pop_method is None:
             pop_method = self.pop_method
         aoslices = self.mol.aoslice_by_atom()
         chg = self.mol.atom_charges()
@@ -304,7 +304,7 @@ class QMMMSCF(QMMM):
         return np.asarray(qm_charges)
 
     def get_s1r_orth(self, pop_method=None):
-        if pop_method == None:
+        if pop_method is None:
             pop_method = self.pop_method
         if self.s1r_orth is None:
             cput0 = (logger.process_clock(), logger.perf_counter())
@@ -332,7 +332,7 @@ class QMMMSCF(QMMM):
         return self.s1r_orth
 
     def get_qm_dipoles(self, dm, s1r=None, pop_method=None):
-        if pop_method == None:
+        if pop_method is None:
             pop_method = self.pop_method
         if s1r is None:
             s1r = self.get_s1r_orth(pop_method=pop_method)
@@ -349,7 +349,7 @@ class QMMMSCF(QMMM):
         '''
         int phi_u phi_v [3(r-Rc)otimes(r-Rc) - |r-Rc|^2] /2 dr
         '''
-        if pop_method == None:
+        if pop_method is None:
             pop_method = self.pop_method
         if self.s1rr_orth is None:
             cput0 = (logger.process_clock(), logger.perf_counter())
@@ -388,7 +388,7 @@ class QMMMSCF(QMMM):
         return self.s1rr_orth
 
     def get_qm_quadrupoles(self, dm, s1rr=None, pop_method=None):
-        if pop_method == None:
+        if pop_method is None:
             pop_method = self.pop_method
         if s1rr is None:
             s1rr = self.get_s1rr_orth(pop_method=pop_method)
@@ -407,7 +407,7 @@ class QMMMSCF(QMMM):
                  + d D_Ix / d dm_uv ewald_pot[1]_Ix
                  + d O_Ixy / d dm_uv ewald_pot[2]_Ixy
         '''
-        if pop_method == None:
+        if pop_method is None:
             pop_method = self.pop_method
         vdiff = np.zeros((mol.nao, mol.nao))
         ovlp = self.get_S_orth(pop_method=pop_method)
@@ -446,7 +446,7 @@ class QMMMSCF(QMMM):
         if mol is None:
             mol = self.mol
         mm_mol = self.mm_mol
-        if pop_method == None:
+        if pop_method is None:
             pop_method = self.pop_method
 
         if mm_ewald_pot is None:
@@ -549,11 +549,16 @@ class QMMMSCF(QMMM):
         e_tot = self.energy_elec(dm, h1e, vhf)[0] + nuc + ewald
         self.scf_summary['nuc'] = nuc.real
         self.scf_summary['ewald'] = ewald
-        print(f'e1:{self.scf_summary['e1']}')
-        print(f'coul:{self.scf_summary['coul']}')
-        print(f'exc:{self.scf_summary['exc']}')
-        print(f'nuc:{self.scf_summary['nuc']}')
-        print(f'ewald:{self.scf_summary['ewald']}')
+        e1_temp = self.scf_summary['e1']
+        print(f'e1:{e1_temp}')
+        coul_temp = self.scf_summary['coul']
+        print(f'coul:{coul_temp}')
+        exc_temp = self.scf_summary['exc']
+        print(f'exc:{exc_temp}')
+        nuc_temp = self.scf_summary['nuc']
+        print(f'nuc:{nuc_temp}')
+        ewald_temp = self.scf_summary['ewald']
+        print(f'ewald:{ewald_temp}')
         return e_tot
 
     def nuc_grad_method(self):
