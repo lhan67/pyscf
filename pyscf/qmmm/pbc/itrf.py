@@ -115,7 +115,7 @@ class QMMM:
     __name_mixin__ = 'QMMM'
 
 class QMMMSCF(QMMM):
-    _keys = {'mm_mol', 's1r_orth', 's1rr_orth', 'AO_orth', 'CO_orth',\
+    _keys = {'mm_mol', 's1r_orth', 's1rr_orth', 'AO_orth', 'CO_orth',
              'mm_ewald_pot', 'qm_ewald_hess', 'e_nuc', 'pop_method'}
 
     to_gpu     = NotImplemented
@@ -325,7 +325,7 @@ class QMMMSCF(QMMM):
                     shls_slice = (0, mol.nbas, 0, mol.nbas)
                     with mol.with_common_orig(mol.atom_coord(i)):
                         s1r_temp = mol.intor('int1e_r', shls_slice=shls_slice)
-                        s1r_orth = lib.einsum('ua,xab,bv->xuv',\
+                        s1r_orth = lib.einsum('ua,xab,bv->xuv',
                                                 AO_orth.T, s1r_temp, AO_orth[:, p0:p1])
                         self.s1r_orth.append(s1r_orth)
             logger.timer(self, 'get_s1r_orth', *cput0)
@@ -377,7 +377,7 @@ class QMMMSCF(QMMM):
                     with mol.with_common_orig(mol.atom_coord(i)):
                         s1rr_temp = mol.intor('int1e_rr', shls_slice=shls_slice)
                         s1rr_temp = s1rr_temp.reshape((3,3,nao,nao))
-                        s1rr_orth = lib.einsum('ua,xyab,bv->xyuv',\
+                        s1rr_orth = lib.einsum('ua,xyab,bv->xyuv',
                                                 AO_orth.T, s1rr_temp, AO_orth[:, p0:p1])
                         s1rr_trace = lib.einsum('xxuv->uv', s1rr_orth)
                         s1rr_orth = 3/2 * s1rr_orth

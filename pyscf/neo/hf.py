@@ -1505,7 +1505,6 @@ class HF(scf.hf.SCF):
                     nuc += q2*(charges*erf(expnts*r)/r).sum()
 
         elif self.mol.mm_mol_pbc is not None:
-            from scipy.special import erf
             # select mm atoms within rcut_hcore
             mm_mol = self.mol.mm_mol_pbc
             Ls = mm_mol.get_lattice_Ls()

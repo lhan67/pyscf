@@ -478,7 +478,6 @@ def grad_nuc_mm_pbc(mf_grad, mol=None):
     '''
     if hasattr(mf_grad, 'de_nuc_mm'):
         return mf_grad.de_nuc_mm
-    from scipy.special import erf
     if mol is None:
         mol = mf_grad.mol
     mm_mol = mol.mm_mol_pbc
