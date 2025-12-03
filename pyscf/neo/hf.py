@@ -10,6 +10,7 @@ from errno import ELIBBAD
 import h5py
 import numpy
 import warnings
+from scipy.special import erf
 from pyscf import df, gto, lib, neo, scf
 from pyscf.data import nist
 from pyscf.lib import logger
@@ -722,12 +723,20 @@ class ComponentSCF(Component):
     def dip_moment(self, mol=None, dm=None, unit='Debye', origin=None, verbose=logger.NOTE,
                    **kwargs):
         if self.is_nucleus:
-            return None
+            if origin is None:
+                origin = numpy.zeros(3)
+            else:
+                origin = numpy.asarray(origin, dtype=numpy.float64)
+            assert origin.shape == (3,)
+            dip = -self.charge * (lib.einsum('xij,ji->x', self.mol.intor_symmetric('int1e_r', comp=3), dm) - origin)
+            if unit.upper() == 'DEBYE':
+                dip *= nist.AU2DEBYE
         # Temporarily modify charge to supress warning about nonzero charge for a neutral molecule
-        charge = self.mol.charge
-        self.mol.charge = self.mol.super_mol.charge
-        dip = super().dip_moment(mol, dm, unit, origin=origin, verbose=verbose, **kwargs)
-        self.mol.charge = charge
+        else:
+            charge = self.mol.charge
+            self.mol.charge = self.mol.super_mol.charge
+            dip = super().dip_moment(mol, dm, unit, origin=origin, verbose=verbose, **kwargs)
+            self.mol.charge = charge
         return dip
 
     def to_gpu(self):
@@ -1482,11 +1491,19 @@ class HF(scf.hf.SCF):
             mm_mol = self.mol.mm_mol
             coords = mm_mol.atom_coords()
             charges = mm_mol.atom_charges()
+            if mm_mol.charge_model == 'gaussian':
+                expnts = numpy.sqrt(mm_mol.get_zetas())
             mol_e = self.components['e'].mol
             for j in range(mol_e.natm):
                 q2, r2 = mol_e.atom_charge(j), mol_e.atom_coord(j)
                 r = lib.norm(r2-coords, axis=1)
-                nuc += q2*(charges/r).sum()
+                if mm_mol.charge_model != 'gaussian':
+                    nuc += q2*(charges/r).sum()
+                else:
+                    # * MM paritcles may be defined as a spreaded distribution. The
+                    # charge distribution may overlap to QM atoms and slightly affect
+                    # the interaction.
+                    nuc += q2*(charges*erf(expnts*r)/r).sum()
 
         elif self.mol.mm_mol_pbc is not None:
             from scipy.special import erf
@@ -1717,7 +1734,26 @@ class HF(scf.hf.SCF):
 
     def dip_moment(self, mol=None, dm=None, unit='Debye', origin=None,
                    verbose=logger.NOTE, **kwargs):
-        raise TypeError('Use CDFT to calculate total dipole moment.') # CDFT will have this
+        if mol is None: mol = self.mol
+        if dm is None: dm = self.make_rdm1()
+        log = logger.new_logger(mol, verbose)
+
+        # Suppress warning about nonzero charge (if neutral)
+        charge = self.components['e'].mol.charge
+        self.components['e'].mol.charge = self.mol.charge
+        el_dip = self.components['e'].dip_moment(mol.components['e'],
+                                                 dm['e'], unit=unit,
+                                                 origin=origin, verbose=verbose-1)
+        self.components['e'].mol.charge = charge
+
+        # Quantum nuclei
+        nucl_dip = 0
+        for t, comp in self.components.items():
+            if t.startswith('n'):
+                nucl_dip += comp.dip_moment(mol.components[t], dm[t], unit=unit, origin=origin, verbose=verbose-1)
+        mol_dip = nucl_dip + el_dip
+        log.note('Dipole moment(X, Y, Z, Debye): %8.5f, %8.5f, %8.5f', *mol_dip)
+        return mol_dip
 
     def quad_moment(self, mol=None, dm=None, unit='DebyeAngstrom', origin=None,
                     verbose=logger.NOTE, **kwargs):
