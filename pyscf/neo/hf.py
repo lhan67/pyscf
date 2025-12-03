@@ -131,6 +131,8 @@ def as_scanner(mf):
     '''Generating a scanner/solver for (C)NEO PES.
     Copied from scf.hf.as_scanner
     '''
+    if mf.mol.mm_mol_pbc is not None:
+        raise NotImplementedError('(C)NEO PBC QM/MM scanner not implemneted.')
     if isinstance(mf, lib.SinglePointScanner):
         return mf
 
@@ -207,6 +209,72 @@ def hcore_qmmm(mol, mm_mol):
             v += numpy.einsum('kpq,k->pq', j3c, -charges[i0:i1])
     return v
 
+def hcore_qmmm_pbc(mol, mm_mol_pbc):
+    # cput0 = (logger.process_clock(), logger.perf_counter())
+    rcut_hcore = mm_mol_pbc.rcut_hcore
+
+    Ls = mm_mol_pbc.get_lattice_Ls()
+    qm_center = numpy.mean(mol.atom_coords(), axis=0)
+
+    mask = numpy.linalg.norm(Ls, axis=-1) < 1e-12
+    Ls[mask] = [numpy.inf] * 3
+    r_qm = (mol.atom_coords() - qm_center)[None,:,:] - Ls[:,None,:]
+    r_qm = numpy.einsum('Lix,Lix->Li', r_qm, r_qm)
+    assert rcut_hcore**2 < numpy.min(r_qm), \
+        "QM image is within rcut_hcore of QM center. " + \
+        f"rcut_hcore = {rcut_hcore} >= min(r_qm) = {numpy.sqrt(numpy.min(r_qm))}"
+    Ls[Ls == numpy.inf] = 0.0
+
+    r_qm = mol.atom_coords() - qm_center
+    r_qm = numpy.einsum('ix,ix->i', r_qm, r_qm)
+    assert rcut_hcore**2 > numpy.max(r_qm), \
+        "Not all QM atoms are within rcut_hcore of QM center. " + \
+        f"rcut_hcore = {rcut_hcore} <= max(r_qm) = {numpy.sqrt(numpy.max(r_qm))}"
+    r_qm = None
+
+    all_coords = lib.direct_sum('ix+Lx->Lix',
+            mm_mol_pbc.atom_coords(), Ls).reshape(-1,3)
+    all_charges = numpy.hstack([mm_mol_pbc.atom_charges()] * len(Ls))
+    dist2 = all_coords - qm_center
+    dist2 = lib.einsum('ix,ix->i', dist2, dist2)
+
+    # charges within rcut_hcore exactly go into hcore
+    mask = dist2 <= rcut_hcore**2
+    charges = all_charges[mask]
+    coords = all_coords[mask]
+    # logger.note(self, '%d MM charges see directly QM density'%charges.shape[0])
+    nao = mol.nao
+    max_memory = mol.super_mol.max_memory - lib.current_memory()[0]
+    blksize = int(min(max_memory*1e6/8/nao**2, 200))
+    blksize = max(blksize, 1)
+    v = 0
+    if mm_mol_pbc.charge_model == 'gaussian' and len(coords) != 0:
+        expnts = numpy.hstack([mm_mol_pbc.get_zetas()] * len(Ls))[mask]
+
+        if mol.cart:
+            intor = 'int3c2e_cart'
+        else:
+            intor = 'int3c2e_sph'
+        cintopt = gto.moleintor.make_cintopt(mol._atm, mol._bas,
+                                                mol._env, intor)
+        for i0, i1 in lib.prange(0, charges.size, blksize):
+            fakemol = gto.fakemol_for_charges(coords[i0:i1], expnts[i0:i1])
+            j3c = df.incore.aux_e2(mol, fakemol, intor=intor,
+                                    aosym='s2ij', cintopt=cintopt)
+            v += lib.einsum('xk,k->x', j3c, -charges[i0:i1])
+        if type(v) is not int:
+            v = lib.unpack_tril(v)
+    elif mm_mol_pbc.charge_model == 'point' and len(coords) != 0:
+        for i0, i1 in lib.prange(0, charges.size, blksize):
+            j3c = mol.intor('int1e_grids', hermi=1, grids=coords[i0:i1])
+            v += lib.einsum('kpq,k->pq', j3c, -charges[i0:i1])
+    else: # no MM charges
+        pass
+
+    j3c = None
+    # logger.timer(self, 'get_hcore', *cput0)
+    return v
+
 def general_scf(method, charge=1, mass=1, is_nucleus=False, nuc_occ_state=0):
     '''Modify SCF (HF and DFT) method to support for general charge
     and general mass, such that positrons and nuclei can be calculated.
@@ -236,7 +304,7 @@ class Component:
     __name_mixin__ = 'Component'
 
 class ComponentSCF(Component):
-    _keys = {'charge', 'mass', 'is_nucleus', 'nuc_occ_state'}
+    _keys = {'charge', 'mass', 'is_nucleus', 'nuc_occ_state', 's1r', 's1rr'}
     def __init__(self, method, charge=1, mass=1, is_nucleus=False, nuc_occ_state=0):
         self.__dict__.update(method.__dict__)
         self.charge = charge
@@ -271,9 +339,151 @@ class ComponentSCF(Component):
         elif hasattr(mol, 'mm_mol'): # elec guess directly uses super_mol
             if mol.mm_mol is not None:
                 h += hcore_qmmm(mol, mol.mm_mol) * self.charge
+
+        if hasattr(mol, 'super_mol'):
+            if mol.super_mol.mm_mol_pbc is not None:
+                h += hcore_qmmm_pbc(mol, mol.super_mol.mm_mol_pbc) * self.charge
+        elif hasattr(mol, 'mm_mol_pbc'): # elec guess directly uses super_mol
+            if mol.mm_mol_pbc is not None:
+                h += hcore_qmmm_pbc(mol, mol.mm_mol_pbc) * self.charge
         return h
 
-    def get_veff(self, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):
+    def get_qm_charges(self, dm):
+        if self.is_nucleus:
+            qm_charges = numpy.zeros(self.mol.natm)
+            qm_charges[self.mol.atom_index] = -self.charge
+            return qm_charges
+        if dm.ndim == 3:
+            dm = dm[0] + dm[1]
+        aoslices = self.mol.aoslice_by_atom()
+        chg = self.mol.atom_charges()
+        dmS = lib.dot(dm, self.get_ovlp())
+        qm_charges = list()
+        for iatm in range(self.mol.natm):
+            p0, p1 = aoslices[iatm, 2:]
+            qm_charges.append(chg[iatm] - numpy.trace(dmS[p0:p1, p0:p1]))
+        return numpy.asarray(qm_charges)
+
+    def get_s1r(self):
+        if not hasattr(self, 's1r'):
+            cput0 = (logger.process_clock(), logger.perf_counter())
+            self.s1r = list()
+            mol = self.mol
+            if self.is_nucleus:
+                self.s1r.append(numpy.zeros((3, mol.nao, mol.nao)))
+                # with mol.with_common_orig(mol.atom_coord(self.mol.atom_index)):
+                #     self.s1r.append(mol.intor('int1e_r'))
+            else:
+                bas_atom = mol._bas[:,gto.ATOM_OF]
+                for i in range(self.mol.natm):
+                    b0, b1 = numpy.where(bas_atom == i)[0][[0,-1]]
+                    shls_slice = (0, mol.nbas, b0, b1+1)
+                    with mol.with_common_orig(mol.atom_coord(i)):
+                        self.s1r.append(
+                            mol.intor('int1e_r', shls_slice=shls_slice))
+            logger.timer(self, 'get_s1r', *cput0)
+        return self.s1r
+
+    def get_qm_dipoles(self, dm, s1r=None):
+        if dm.ndim == 3:
+            dm = dm[0] + dm[1]
+        if s1r is None:
+            s1r = self.get_s1r()
+        if self.is_nucleus:
+            qm_dipoles = numpy.zeros((self.mol.natm, 3))
+            return qm_dipoles
+        aoslices = self.mol.aoslice_by_atom()
+        qm_dipoles = list()
+        for iatm in range(self.mol.natm):
+            p0, p1 = aoslices[iatm, 2:]
+            qm_dipoles.append(
+                -lib.einsum('uv,xvu->x', dm[p0:p1], s1r[iatm]))
+        return numpy.asarray(qm_dipoles)
+
+    def get_s1rr(self):
+        r'''
+        \int phi_u phi_v [3(r-Rc)\otimes(r-Rc) - |r-Rc|^2] /2 dr
+        '''
+        if not hasattr(self, 's1rr'):
+            cput0 = (logger.process_clock(), logger.perf_counter())
+            self.s1rr = list()
+            mol = self.mol
+            nao = mol.nao
+            if self.is_nucleus:
+                with mol.with_common_orig(mol.atom_coord(mol.atom_index)):
+                    s1rr_ = mol.intor('int1e_rr')
+                    s1rr_ = s1rr_.reshape((3,3,nao,-1))
+                    s1rr_trace = lib.einsum('xxuv->uv', s1rr_)
+                    s1rr_ = 3/2 * s1rr_
+                    for k in range(3):
+                        s1rr_[k,k] -= 0.5 * s1rr_trace
+                    self.s1rr.append(s1rr_)
+            else:
+                bas_atom = mol._bas[:,gto.ATOM_OF]
+                for i in range(self.mol.natm):
+                    b0, b1 = numpy.where(bas_atom == i)[0][[0,-1]]
+                    shls_slice = (0, mol.nbas, b0, b1+1)
+                    with mol.with_common_orig(mol.atom_coord(i)):
+                        s1rr_ = mol.intor('int1e_rr', shls_slice=shls_slice)
+                        s1rr_ = s1rr_.reshape((3,3,nao,-1))
+                        s1rr_trace = lib.einsum('xxuv->uv', s1rr_)
+                        s1rr_ = 3/2 * s1rr_
+                        for k in range(3):
+                            s1rr_[k,k] -= 0.5 * s1rr_trace
+                        self.s1rr.append(s1rr_)
+            logger.timer(self, 'get_s1rr', *cput0)
+        return self.s1rr
+
+    def get_qm_quadrupoles(self, dm, s1rr=None):
+        if dm.ndim == 3:
+            dm = dm[0] + dm[1]
+        if s1rr is None:
+            s1rr = self.get_s1rr()
+        if self.is_nucleus:
+            qm_quadrupoles = numpy.zeros((self.mol.natm, 3, 3))
+            qm_quadrupoles[self.mol.atom_index] = (-lib.einsum('uv,xyvu->xy', dm, s1rr[0])
+                                                   * self.charge)
+            return qm_quadrupoles
+        aoslices = self.mol.aoslice_by_atom()
+        qm_quadrupoles = list()
+        for iatm in range(self.mol.natm):
+            p0, p1 = aoslices[iatm, 2:]
+            qm_quadrupoles.append(
+                -lib.einsum('uv,xyvu->xy', dm[p0:p1], s1rr[iatm]))
+        return numpy.asarray(qm_quadrupoles)
+
+    def get_vdiff(self, mol, ewald_pot):
+        '''
+        vdiff_uv = d Q_I / d dm_uv ewald_pot[0]_I
+                    + d D_Ix / d dm_uv ewald_pot[1]_Ix
+                    + d O_Ixy / d dm_uv ewald_pot[2]_Ixy
+        '''
+        vdiff = numpy.zeros((mol.nao, mol.nao))
+        ovlp = self.get_ovlp()
+        s1r = self.get_s1r()
+        s1rr = self.get_s1rr()
+        if self.is_nucleus:
+            iatm = mol.atom_index
+            v0 = ewald_pot[0][iatm]
+            v1 = ewald_pot[1][iatm]
+            v2 = ewald_pot[2][iatm]
+            vdiff -= (v0 * ovlp + lib.einsum('x,xuv->uv', v1, s1r[0])
+                      + lib.einsum('xy,xyuv->uv', v2, s1rr[0]))
+            vdiff = (vdiff + vdiff.T) / 2
+            return vdiff
+        aoslices = mol.aoslice_by_atom()
+        for iatm in range(mol.natm):
+            v0 = ewald_pot[0][iatm]
+            v1 = ewald_pot[1][iatm]
+            v2 = ewald_pot[2][iatm]
+            p0, p1 = aoslices[iatm, 2:]
+            vdiff[:,p0:p1] -= v0 * ovlp[:,p0:p1]
+            vdiff[:,p0:p1] -= lib.einsum('x,xuv->uv', v1, s1r[iatm])
+            vdiff[:,p0:p1] -= lib.einsum('xy,xyuv->uv', v2, s1rr[iatm])
+        vdiff = (vdiff + vdiff.T) / 2
+        return vdiff
+
+    def get_veff(self, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1, ewald_pot=None):
         if self.is_nucleus: # Nucleus does not have self-type interaction
             if mol is None:
                 mol = self.mol
@@ -325,7 +535,25 @@ class ComponentSCF(Component):
             else: # HF
                 assert not hasattr(self._vint, 'vj') # Must be KS when epc is enabled
                 veff = lib.tag_array(veff + self._vint, vhf=vhf)
+
+            if ewald_pot is not None:
+                vdiff = self.get_vdiff(mol, ewald_pot)
+                if hasattr(veff, '__dict__'):
+                    metadata = veff.__dict__
+                    veff = lib.tag_array(veff + vdiff, veff_rs=veff, **metadata)
+                else:
+                    veff = lib.tag_array(veff + vdiff, veff_rs=veff)
         return veff
+
+    def energy_elec(self, dm=None, h1e=None, vhf=None):
+        if vhf is None:
+            # use the original veff to compute energy
+            vhf = super().get_veff(self.mol, dm)
+            return super().energy_elec(dm=dm, h1e=h1e, vhf=vhf)
+        elif not hasattr(vhf, 'veff_rs'):
+            return super().energy_elec(dm=dm, h1e=h1e, vhf=vhf)
+        else:
+            return super().energy_elec(dm=dm, h1e=h1e, vhf=vhf.veff_rs)
 
     def get_occ(self, mo_energy=None, mo_coeff=None):
         '''Support fractional occupation. For nucleus, make sure it is a single particle'''
@@ -961,6 +1189,8 @@ class HF(scf.hf.SCF):
                 self.components[t] = general_scf(mf, charge=charge)
         self.interactions = generate_interactions(self.components, InteractionCoulomb,
                                                   self.max_memory)
+        self.mm_ewald_pot = None
+        self.qm_ewald_hess = None
 
     # mf_elec and mf_nuc for backward compatibility
     @property
@@ -1073,6 +1303,20 @@ class HF(scf.hf.SCF):
                 charges = self.mol.mm_mol.atom_charges()
                 for i, z in enumerate(charges):
                     logger.debug(self, '%.9g    %s', z, coords[i])
+
+        elif self.mol.mm_mol_pbc is not None:
+            logger.info(self, '** Add background charges for %s **',
+                        self.__class__.__name__)
+            _a = self.mol.mm_mol_pbc.lattice_vectors()
+            logger.info(self, 'lattice vectors  a1 [%.9f, %.9f, %.9f]', *_a[0])
+            logger.info(self, '                 a2 [%.9f, %.9f, %.9f]', *_a[1])
+            logger.info(self, '                 a3 [%.9f, %.9f, %.9f]', *_a[2])
+            if self.verbose >= logger.DEBUG2:
+                logger.debug2(self, 'Charge      Location')
+                coords = self.mol.mm_mol_pbc.atom_coords()
+                charges = self.mol.mm_mol_pbc.atom_charges()
+                for i, z in enumerate(charges):
+                    logger.debug2(self, '%.9g    %s', z, coords[i])
         return self
 
     def check_sanity(self):
@@ -1150,7 +1394,7 @@ class HF(scf.hf.SCF):
                 # Do not invoke possibly expensive QMMM during init guess
                 mol_tmp.build(quantum_nuc=[comp.mol.atom_index],
                               nuc_basis=mol.nuclear_basis,
-                              mm_mol=None, dump_input=False, parse_arg=False,
+                              mm_mol=None, mm_mol_pbc=None, dump_input=False, parse_arg=False,
                               verbose=mol.verbose, output=mol.output,
                               max_memory=mol.max_memory, atom=mol.atom, unit=mol.unit,
                               nucmod=mol.nucmod, ecp=mol.ecp, pseudo=mol.pseudo,
@@ -1222,6 +1466,10 @@ class HF(scf.hf.SCF):
         self.scf_summary['nuc'] = nuc.real
 
         e_tot = self.energy_elec(dm, h1e, vhf, vint)[0] + nuc
+        if self.mol.mm_mol_pbc is not None:
+            ewald = self.energy_ewald(dm=dm)
+            e_tot += ewald
+            self.scf_summary['ewald'] = ewald
         if self.disp is not None:
             self.components['e'].disp = self.disp
         if self.components['e'].do_disp():
@@ -1255,6 +1503,34 @@ class HF(scf.hf.SCF):
                     # charge distribution may overlap to QM atoms and slightly affect
                     # the interaction.
                     nuc += q2*(charges*erf(expnts*r)/r).sum()
+
+        elif self.mol.mm_mol_pbc is not None:
+            from scipy.special import erf
+            # select mm atoms within rcut_hcore
+            mm_mol = self.mol.mm_mol_pbc
+            Ls = mm_mol.get_lattice_Ls()
+            qm_center = numpy.mean(self.mol.atom_coords(), axis=0)
+            all_coords = lib.direct_sum('ix+Lx->Lix',
+                mm_mol.atom_coords(), Ls).reshape(-1,3)
+            all_charges = numpy.hstack([mm_mol.atom_charges()] * len(Ls))
+            zetas = mm_mol.get_zetas()
+            if self.mol.mm_mol_pbc.charge_model == 'gaussian':
+                all_expnts = numpy.hstack([numpy.sqrt(zetas)] * len(Ls))
+            else:
+                all_expnts = numpy.full(len(mm_mol.atom_coords()) * len(Ls), numpy.sqrt(zetas))
+            dist2 = all_coords - qm_center
+            dist2 = lib.einsum('ix,ix->i', dist2, dist2)
+            mask = dist2 <= mm_mol.rcut_hcore**2
+            charges = all_charges[mask]
+            coords = all_coords[mask]
+            expnts = all_expnts[mask]
+
+            # qm_nuc - mm_pc
+            mol_e = self.components['e'].mol
+            for j in range(mol_e.natm):
+                q2, r2 = mol_e.atom_charge(j), mol_e.atom_coord(j)
+                r = lib.norm(r2-coords, axis=1)
+                nuc += q2*(charges * erf(expnts*r) /r).sum()
         return nuc
 
     def scf(self, dm0=None, **kwargs):
@@ -1373,11 +1649,26 @@ class HF(scf.hf.SCF):
         '''Self-type JK'''
         if mol is None: mol = self.mol
         if dm is None: dm = self.make_rdm1()
+        ewald_pot = None
+        if mol.mm_mol_pbc is not None:
+            if self.mm_ewald_pot is not None:
+                mm_ewald_pot = self.mm_ewald_pot
+            else:
+                mm_ewald_pot = self.get_mm_ewald_pot(mol, mol.mm_mol_pbc)
+                self.mm_ewald_pot = mm_ewald_pot
+            if self.qm_ewald_hess is not None:
+                qm_ewald_pot = self.get_qm_ewald_pot(mol, dm, self.qm_ewald_hess)
+            else:
+                qm_ewald_pot = self.get_qm_ewald_pot(mol, dm)
+            ewald_pot = \
+                mm_ewald_pot[0] + qm_ewald_pot[0], \
+                mm_ewald_pot[1] + qm_ewald_pot[1], \
+                mm_ewald_pot[2] + qm_ewald_pot[2]
         vhf = {}
         for t, comp in self.components.items():
             dm_last_t = dm_last.get(t, 0) if isinstance(dm_last, dict) else 0
             vhf_last_t = vhf_last.get(t, 0) if isinstance(vhf_last, dict) else 0
-            vhf[t] = comp.get_veff(mol.components[t], dm[t], dm_last_t, vhf_last_t, hermi)
+            vhf[t] = comp.get_veff(mol.components[t], dm[t], dm_last_t, vhf_last_t, hermi, ewald_pot)
         return vhf
 
     def get_vint(self, mol=None, dm=None, **kwargs):
@@ -1474,6 +1765,68 @@ class HF(scf.hf.SCF):
         import pyscf.neo.df
         return pyscf.neo.df.density_fit(self, auxbasis=auxbasis,
                                         ee_only_dfj=ee_only_dfj, df_ne=df_ne)
+
+    def get_qm_charges(self, dm):
+        qm_charges = numpy.zeros(self.mol.natm)
+        for t, comp in self.components.items():
+            qm_charges += comp.get_qm_charges(dm[t])
+        return qm_charges
+
+    def get_qm_dipoles(self, dm):
+        qm_dipoles = numpy.zeros((self.mol.natm, 3))
+        for t, comp in self.components.items():
+            qm_dipoles += comp.get_qm_dipoles(dm[t])
+        return qm_dipoles
+
+    def get_qm_quadrupoles(self, dm):
+        qm_quadrupoles = numpy.zeros((self.mol.natm, 3, 3))
+        for t, comp in self.components.items():
+            qm_quadrupoles += comp.get_qm_quadrupoles(dm[t])
+        return qm_quadrupoles
+
+    def get_qm_ewald_pot(self, mol=None, dm=None, qm_ewald_hess=None):
+        if mol is None:
+            mol = self.mol
+        if qm_ewald_hess is None:
+            qm_ewald_hess = mol.mm_mol_pbc.get_ewald_pot(mol.atom_coords())
+            self.qm_ewald_hess = qm_ewald_hess
+        charges = self.get_qm_charges(dm)
+        dips = self.get_qm_dipoles(dm)
+        quads = self.get_qm_quadrupoles(dm)
+        ewpot0  = numpy.einsum('ij,j->i', qm_ewald_hess[0], charges)
+        ewpot0 += numpy.einsum('ijx,jx->i', qm_ewald_hess[1], dips)
+        ewpot0 += numpy.einsum('ijxy,jxy->i', qm_ewald_hess[3], quads)
+        ewpot1  = numpy.einsum('ijx,i->jx', qm_ewald_hess[1], charges)
+        ewpot1 += numpy.einsum('ijxy,jy->ix', qm_ewald_hess[2], dips)
+        ewpot2  = numpy.einsum('ijxy,j->ixy', qm_ewald_hess[3], charges)
+        return ewpot0, ewpot1, ewpot2
+
+    def get_mm_ewald_pot(self, mol=None, mm_mol=None):
+        if mol is None:
+            mol = self.mol
+        return mol.mm_mol_pbc.get_ewald_pot(
+            mol.atom_coords(),
+            mm_mol.atom_coords(), mm_mol.atom_charges())
+
+    def energy_ewald(self, dm=None, mm_ewald_pot=None, qm_ewald_pot=None):
+        # QM-QM and QM-MM pbc correction
+        if dm is None:
+            dm = self.make_rdm1()
+        if mm_ewald_pot is None:
+            if hasattr(self, 'mm_ewald_pot'):
+                mm_ewald_pot = self.mm_ewald_pot
+            else:
+                mm_ewald_pot = self.get_mm_ewald_pot(self.mol, self.mm_mol)
+        if qm_ewald_pot is None:
+            qm_ewald_pot = self.get_qm_ewald_pot(self.mol, dm, self.qm_ewald_hess)
+        ewald_pot = mm_ewald_pot[0] + qm_ewald_pot[0] / 2
+        e  = numpy.einsum('i,i->', numpy.asarray(ewald_pot), self.get_qm_charges(dm))
+        ewald_pot = mm_ewald_pot[1] + qm_ewald_pot[1] / 2
+        e += numpy.einsum('ix,ix->', numpy.asarray(ewald_pot), self.get_qm_dipoles(dm))
+        ewald_pot = mm_ewald_pot[2] + qm_ewald_pot[2] / 2
+        e += numpy.einsum('ixy,ixy->', numpy.asarray(ewald_pot), self.get_qm_quadrupoles(dm))
+        # TODO add energy correction if sum(charges) !=0 ?
+        return e
 
     def sfx2c1e(self):
         raise NotImplementedError

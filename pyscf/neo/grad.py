@@ -15,6 +15,7 @@ from pyscf.scf.jk import get_jk
 from pyscf.dft.numint import eval_ao, eval_rho, _scale_ao
 from pyscf.grad.rks import _d1_dot_
 from pyscf.neo.ks import precompute_epc_electron, eval_epc
+from pyscf.qmmm.pbc.tools import get_multipole_tensors_pp, get_multipole_tensors_pg
 
 
 def general_grad(grad_method):
@@ -76,6 +77,53 @@ class ComponentGrad:
                 for i0, i1 in lib.prange(0, charges.size, blksize):
                     j3c = mol.intor('int1e_grids_ip', grids=coords[i0:i1])
                     v += numpy.einsum('ikpq,k->ipq', j3c, charges[i0:i1])
+            h += self.base.charge * v
+
+        elif mol.super_mol.mm_mol_pbc is not None:
+            mm_mol = mol.super_mol.mm_mol_pbc
+            rcut_hcore = mm_mol.rcut_hcore
+            coords = mm_mol.atom_coords()
+            charges = mm_mol.atom_charges()
+
+            Ls = mm_mol.get_lattice_Ls()
+
+            qm_center = numpy.mean(mol.atom_coords(), axis=0)
+            all_coords = (coords[None,:,:] + Ls[:,None,:]).reshape(-1,3)
+            all_charges = numpy.hstack([charges] * len(Ls))
+            dist2 = all_coords - qm_center
+            dist2 = lib.einsum('ix,ix->i', dist2, dist2)
+            # charges within rcut_hcore exactly go into hcore
+            mask = dist2 <= rcut_hcore**2
+            charges = all_charges[mask]
+            coords = all_coords[mask]
+            nao = mol.nao
+            max_memory = mol.super_mol.max_memory - lib.current_memory()[0]
+            blksize = int(min(max_memory*1e6/8/nao**2/3, 200))
+            blksize = max(blksize, 1)
+            v=0
+            if mm_mol.charge_model == 'gaussian' and len(coords) != 0:
+                expnts = numpy.hstack([mm_mol.get_zetas()] * len(Ls))[mask]
+                if mol.cart:
+                    intor = 'int3c2e_ip1_cart'
+                else:
+                    intor = 'int3c2e_ip1_sph'
+                cintopt = gto.moleintor.make_cintopt(mol._atm, mol._bas,
+                                                     mol._env, intor)
+                for i0, i1 in lib.prange(0, charges.size, blksize):
+                    fakemol = gto.fakemol_for_charges(coords[i0:i1], expnts[i0:i1])
+                    j3c = df.incore.aux_e2(mol, fakemol, intor, aosym='s1',
+                                           comp=3, cintopt=cintopt)
+                    v += numpy.einsum('ipqk,k->ipq', j3c, charges[i0:i1])
+            elif mm_mol.charge_model == 'point' and len(coords) != 0:
+                # raise RuntimeError("Not tested yet")
+                max_memory = mol.super_mol.max_memory - lib.current_memory()[0]
+                blksize = int(min(max_memory*1e6/8/nao**2/3, 200))
+                blksize = max(blksize, 1)
+                for i0, i1 in lib.prange(0, len(coords), blksize):
+                    j3c = mol.intor('int1e_grids_ip', grids=coords[i0:i1])
+                    v += numpy.einsum('ikpq,k->ipq', j3c, charges[i0:i1])
+            else: # len(coords) == 0
+                pass
             h += self.base.charge * v
         return h
 
@@ -334,6 +382,65 @@ def grad_hcore_mm(mf_grad, dm=None, mol=None):
                                      dm_comp).T * comp.charge
     return g
 
+def grad_hcore_mm_pbc(mf_grad, dm=None, mol=None):
+    '''Calculate QMMM gradient for PBC MM atoms'''
+    if mol is None:
+        mol = mf_grad.mol
+    mm_mol = mol.mm_mol_pbc
+    if mm_mol is None:
+        warnings.warn('Not a PBC QM/MM calculation, grad_mm should not be called!')
+        return None
+    mf = mf_grad.base
+    if dm is None:
+        dm = mf.make_rdm1()
+    rcut_hcore = mm_mol.rcut_hcore
+
+    coords = mm_mol.atom_coords()
+    charges = mm_mol.atom_charges()
+    expnts = mm_mol.get_zetas()
+
+    Ls = mm_mol.get_lattice_Ls()
+
+    qm_center = numpy.mean(mol.atom_coords(), axis=0)
+    all_coords = (coords[None,:,:] + Ls[:,None,:]).reshape(-1,3)
+    all_charges = numpy.hstack([charges] * len(Ls))
+    if mol.mm_mol_pbc.charge_model == 'gaussian':
+        all_expnts = numpy.hstack([expnts] * len(Ls))
+    else:
+        all_expnts = numpy.full(len(mm_mol.atom_coords()) * len(Ls), expnts)
+    dist2 = all_coords - qm_center
+    dist2 = numpy.einsum('ix,ix->i', dist2, dist2)
+
+    # charges within rcut_hcore exactly go into hcore
+    mask = dist2 <= rcut_hcore**2
+    charges = all_charges[mask]
+    coords = all_coords[mask]
+    expnts = all_expnts[mask]
+
+    g = numpy.zeros_like(all_coords)
+    if len(coords) != 0:
+        for t, comp in mf.components.items():
+            mol_comp = comp.mol
+            dm_comp = dm[t]
+            intor = 'int3c2e_ip2'
+            nao = mol_comp.nao
+            max_memory = mol.max_memory - lib.current_memory()[0]
+            blksize = int(min(max_memory*1e6/8/nao**2/3, 200))
+            blksize = max(blksize, 1)
+            cintopt = gto.moleintor.make_cintopt(mol_comp._atm, mol_comp._bas,
+                                                    mol_comp._env, intor)
+
+            g_comp_ = numpy.zeros_like(coords)
+            for i0, i1 in lib.prange(0, charges.size, blksize):
+                fakemol = gto.fakemol_for_charges(coords[i0:i1], expnts[i0:i1])
+                j3c = df.incore.aux_e2(mol_comp, fakemol, intor, aosym='s1',
+                                        comp=3, cintopt=cintopt)
+                g_comp_[i0:i1] = lib.einsum('ipqk,qp->ik', j3c * charges[i0:i1], dm_comp).T
+            g[mask] += (comp.charge * g_comp_)
+        g = g.reshape(len(Ls), -1, 3)
+        g = numpy.sum(g, axis=0)
+    return g
+
 def grad_nuc_mm(mf_grad, mol=None):
     '''Nuclear gradients of the QM-MM nuclear energy
     (in the form of point charge Coulomb interactions)
@@ -364,6 +471,52 @@ def grad_nuc_mm(mf_grad, mol=None):
         g_mm += q1 * numpy.einsum('i,ix,i->ix', charges, r1-coords, coulkern)
     return g_mm
 
+def grad_nuc_mm_pbc(mf_grad, mol=None):
+    '''Nuclear gradients of the QM-MM nuclear energy
+    (in the form of point charge Coulomb interactions)
+    with respect to PBC MM atoms.
+    '''
+    if hasattr(mf_grad, 'de_nuc_mm'):
+        return mf_grad.de_nuc_mm
+    from scipy.special import erf
+    if mol is None:
+        mol = mf_grad.mol
+    mm_mol = mol.mm_mol_pbc
+    if mm_mol is None:
+        warnings.warn('Not a PBC QM/MM calculation, grad_mm should not be called!')
+        return None
+    coords = mm_mol.atom_coords()
+    charges = mm_mol.atom_charges()
+    Ls = mm_mol.get_lattice_Ls()
+    qm_center = numpy.mean(mol.atom_coords(), axis=0)
+    all_coords = lib.direct_sum('ix+Lx->Lix',
+            mm_mol.atom_coords(), Ls).reshape(-1,3)
+    all_charges = numpy.hstack([mm_mol.atom_charges()] * len(Ls))
+    zetas = mm_mol.get_zetas()
+    if mol.mm_mol_pbc.charge_model == 'gaussian':
+        all_expnts = numpy.hstack([numpy.sqrt(zetas)] * len(Ls))
+    else:
+        all_expnts = numpy.full(len(mm_mol.atom_coords()) * len(Ls), numpy.sqrt(zetas))
+    dist2 = all_coords - qm_center
+    dist2 = lib.einsum('ix,ix->i', dist2, dist2)
+    mask = dist2 <= mm_mol.rcut_hcore**2
+    charges = all_charges[mask]
+    coords = all_coords[mask]
+    expnts = all_expnts[mask]
+
+    g_mm = numpy.zeros_like(all_coords)
+    mol_e = mol.components['e']
+    for i in range(mol_e.natm):
+        q1 = mol_e.atom_charge(i)
+        r1 = mol_e.atom_coord(i)
+        r = lib.norm(r1-coords, axis=1)
+        g_mm[mask] += q1 * lib.einsum('i,ix,i->ix', charges, r1-coords, erf(expnts*r)/r**3)
+        g_mm[mask] -= q1 * lib.einsum('i,ix,i->ix', charges * expnts * 2 / numpy.sqrt(numpy.pi),
+                                            r1-coords, numpy.exp(-expnts**2 * r**2)/r**2)
+    g_mm = g_mm.reshape(len(Ls), -1, 3)
+    g_mm = numpy.sum(g_mm, axis=0)
+    return g_mm
+
 def as_scanner(mf_grad):
     '''Generating a nuclear gradients scanner/solver (for geometry optimizer).
 
@@ -372,6 +525,8 @@ def as_scanner(mf_grad):
 
     Copied from grad.rhf.as_scanner
     '''
+    if mf_grad.base.mol.mm_mol_pbc is not None:
+        raise NotImplementedError('(C)NEO PBC QM/MM scanner not implemneted.')
     if isinstance(mf_grad, lib.GradScanner):
         return mf_grad
 
@@ -442,6 +597,14 @@ class Gradients(rhf_grad.GradientsBase):
                 for i, z in enumerate(charges):
                     logger.debug1(self, '%.9g    %s', z, coords[i])
             return self
+        elif self.mol.mm_mol_pbc is not None:
+            logger.info(self, '** Add periodic background charges for %s **',
+                        self.__class__.__name__)
+            if self.verbose >= logger.DEBUG1:
+                logger.debug1(self, 'Charge      Location')
+                coords = self.mol.mm_mol_pbc.atom_coords()
+                charges = self.mol.mm_mol_pbc.atom_charges()
+            return self
 
     def reset(self, mol=None):
         if mol is not None:
@@ -484,6 +647,44 @@ class Gradients(rhf_grad.GradientsBase):
                 g_mm[i] = -q1 * numpy.einsum('i,ix,i->x', charges, r1-coords, coulkern)
             if atmlst is not None:
                 g_mm = g_mm[atmlst]
+        elif mol.mm_mol_pbc is not None:
+            from scipy.special import erf
+            assert atmlst is None
+            mm_mol = mol.mm_mol_pbc
+            coords = mm_mol.atom_coords()
+            charges = mm_mol.atom_charges()
+            Ls = mm_mol.get_lattice_Ls()
+            qm_center = numpy.mean(mol.atom_coords(), axis=0)
+            all_coords = (coords[None, :, :] + Ls[:, None, :]).reshape(-1, 3)
+            all_charges = numpy.hstack([charges] * len(Ls))
+            zetas = mm_mol.get_zetas()
+            if mol.mm_mol_pbc.charge_model == 'gaussian':
+                all_expnts = numpy.hstack([numpy.sqrt(zetas)] * len(Ls))
+            else:
+                all_expnts = numpy.full(len(mm_mol.atom_coords()) * len(Ls), numpy.sqrt(zetas))
+            dist2 = all_coords - qm_center
+            dist2 = numpy.einsum('ix,ix->i', dist2, dist2)
+            mask = dist2 <= mm_mol.rcut_hcore**2
+            charges = all_charges[mask]
+            coords = all_coords[mask]
+            expnts = all_expnts[mask]
+            g_mm = numpy.zeros_like(all_coords)
+            mol_e = mol.components['e']
+            for i in range(mol_e.natm):
+                q1 = mol_e.atom_charge(i)
+                r1 = numpy.asarray(mol_e.atom_coord(i))
+                r = numpy.linalg.norm(r1-coords, axis=1)
+                g_mm_ = q1 * numpy.einsum('ix,i->ix', r1-coords,
+                                      charges * erf(expnts*r)/r**3)
+                g_mm_ -= q1 * numpy.einsum('ix,i->ix', r1-coords,
+                                       charges * expnts * 2 / numpy.sqrt(numpy.pi)
+                                       * numpy.exp(-expnts**2 * r**2)/r**2)
+                g_mm[mask] += g_mm_
+                g_qm[i] -= numpy.sum(g_mm_, axis=0)
+            g_mm = g_mm.reshape(len(Ls), -1, 3)
+            g_mm = numpy.sum(g_mm, axis=0)
+            self.de_nuc_mm = g_mm
+            return g_qm
         else:
             g_mm = 0
         return g_qm + g_mm
@@ -516,7 +717,6 @@ class Gradients(rhf_grad.GradientsBase):
 
         # Add inter-component interaction gradient
         de += self.grad_int(mo_energy, mo_coeff, mo_occ, atmlst)
-
         # Add EPC contribution if needed
         if hasattr(self.base, 'epc') and self.base.epc is not None:
             de += self.grad_epc(mo_energy, mo_coeff, mo_occ, atmlst)
@@ -530,15 +730,490 @@ class Gradients(rhf_grad.GradientsBase):
         self._finalize()
         return self.de
 
+    def grad_ewald(self, dm=None, with_mm=False, mm_ewald_pot=None, qm_ewald_pot=None):
+        '''PBC correction energy grad w.r.t. qm and mm atom positions
+        '''
+        cput0 = (logger.process_clock(), logger.perf_counter())
+        if dm is None:
+            dm = self.base.make_rdm1()
+        mol = self.base.mol
+        cell = self.base.mol.mm_mol_pbc
+        assert cell is not None and cell.dimension == 3
+        qm_charges = self.base.get_qm_charges(dm)
+        qm_dipoles = self.base.get_qm_dipoles(dm)
+        qm_quads = self.base.get_qm_quadrupoles(dm)
+        qm_coords = mol.atom_coords()
+        mm_charges = cell.atom_charges()
+        mm_coords = cell.atom_coords()
+
+        # nuc grad due to qm multipole change due to ovlp change
+        # only electron has this part
+        qm_multipole_grad = numpy.zeros_like(qm_coords)
+
+        if mm_ewald_pot is None:
+            if self.base.mm_ewald_pot is not None:
+                mm_ewald_pot = self.base.mm_ewald_pot
+            else:
+                mm_ewald_pot = self.base.get_mm_ewald_pot(mol, cell)
+        if qm_ewald_pot is None:
+            qm_ewald_pot = self.base.get_qm_ewald_pot(mol, dm, self.base.qm_ewald_hess)
+        ewald_pot = \
+            mm_ewald_pot[0] + qm_ewald_pot[0], \
+            mm_ewald_pot[1] + qm_ewald_pot[1], \
+            mm_ewald_pot[2] + qm_ewald_pot[2]
+
+        mol_e = mol.components['e']
+        dEds = numpy.zeros((mol_e.nao, mol_e.nao))
+        dEdsr = numpy.zeros((3, mol_e.nao, mol_e.nao))
+        dEdsrr = numpy.zeros((3, 3, mol_e.nao, mol_e.nao))
+        s1 = self.get_ovlp(mol_e) # = -mol.intor('int1e_ipovlp')
+        s1r = list()
+        s1rr = list()
+        bas_atom = mol_e._bas[:,gto.ATOM_OF]
+        aoslices = mol_e.aoslice_by_atom()
+        for iatm in range(mol_e.natm):
+            v0 = ewald_pot[0][iatm]
+            v1 = ewald_pot[1][iatm]
+            v2 = ewald_pot[2][iatm]
+            p0, p1 = aoslices[iatm, 2:]
+
+            dEds[p0:p1] -= v0 * dm['e'][p0:p1]
+            dEdsr[:,p0:p1] -= numpy.einsum('x,uv->xuv', v1, dm['e'][p0:p1])
+            dEdsrr[:,:,p0:p1] -= numpy.einsum('xy,uv->xyuv', v2, dm['e'][p0:p1])
+
+            b0, b1 = numpy.where(bas_atom == iatm)[0][[0,-1]]
+            shlslc = (b0, b1+1, 0, mol_e.nbas)
+            with mol_e.with_common_orig(qm_coords[iatm]):
+                # s1r[a,x,u,v] = \int phi_u (r_a-Ri_a) (-\nabla_x phi_v) dr
+                s1r.append(-mol_e.intor('int1e_irp', shls_slice=shlslc).
+                           reshape(3, 3, -1, mol_e.nao))
+                # s1rr[a,b,x,u,v] =
+                # \int phi_u [3/2*(r_a-Ri_a)(r_b-Ri_b)-1/2*(r-Ri)^2 delta_ab] (-\nable_x phi_v) dr
+                s1rr_ = -mol_e.intor('int1e_irrp', shls_slice=shlslc).\
+                                     reshape(3, 3, 3, -1, mol_e.nao)
+                s1rr_trace = numpy.einsum('aaxuv->xuv', s1rr_)
+                s1rr_ *= 3 / 2
+                for k in range(3):
+                    s1rr_[k,k] -= 0.5 * s1rr_trace
+                s1rr.append(s1rr_)
+
+        for jatm in range(mol_e.natm):
+            p0, p1 = aoslices[jatm, 2:]
+
+            # d E_qm_pc / d Ri with fixed ewald_pot
+            qm_multipole_grad[jatm] += \
+                numpy.einsum('uv,xuv->x', dEds[p0:p1], s1[:,p0:p1]) \
+              - numpy.einsum('uv,xuv->x', dEds[:,p0:p1], s1[:,:,p0:p1])
+
+            # d E_qm_dip / d Ri
+            qm_multipole_grad[jatm] -= \
+                 numpy.einsum('auv,axuv->x', dEdsr[:,p0:p1], s1r[jatm])
+            s1r_ = list()
+            for iatm in range(mol_e.natm):
+                s1r_.append(s1r[iatm][...,p0:p1])
+            s1r_ = numpy.concatenate(s1r_, axis=-2)
+            qm_multipole_grad[jatm] += numpy.einsum('auv,axuv->x', dEdsr[...,p0:p1], s1r_)
+
+            # d E_qm_quad / d Ri
+            qm_multipole_grad[jatm] -= \
+                    numpy.einsum('abuv,abxuv->x', dEdsrr[:,:,p0:p1], s1rr[jatm])
+            s1rr_ = list()
+            for iatm in range(mol_e.natm):
+                s1rr_.append(s1rr[iatm][...,p0:p1])
+            s1rr_ = numpy.concatenate(s1rr_, axis=-2)
+            qm_multipole_grad[jatm] += numpy.einsum('abuv,abxuv->x', dEdsrr[...,p0:p1], s1rr_)
+
+        cput1 = logger.timer(self, 'grad_ewald pulay', *cput0)
+        s1 = s1r = s1rr = dEds = dEdsr = dEdsrr = None
+
+        ew_eta, ew_cut = cell.get_ewald_params()
+
+        # ---------------------------------------------- #
+        # -------- Ewald real-space gradient ----------- #
+        # ---------------------------------------------- #
+
+        Lall = cell.get_lattice_Ls()
+
+        from pyscf import pbc
+        rmax_qm = max(numpy.linalg.norm(qm_coords - numpy.mean(qm_coords, axis=0), axis=-1))
+        qm_ewovrl_grad = numpy.zeros_like(qm_coords)
+
+        grad_Tij = lambda R, r: get_multipole_tensors_pp(R, [1,2,3], r)
+        grad_kTij = lambda R, r, eta: get_multipole_tensors_pg(R, eta, [1,2,3], r)
+
+        def grad_qm_multipole(Tija, Tijab, Tijabc,
+                              qm_charges, qm_dipoles, qm_quads,
+                              mm_charges):
+            Tc   = lib.einsum('ijx,j->ix', Tija, mm_charges)
+            res  = lib.einsum('i,ix->ix', qm_charges, Tc)
+            Tc   = lib.einsum('ijxa,j->ixa', Tijab, mm_charges)
+            res += lib.einsum('ia,ixa->ix', qm_dipoles, Tc)
+            Tc   = lib.einsum('ijxab,j->ixab', Tijabc, mm_charges)
+            res += lib.einsum('iab,ixab->ix', qm_quads, Tc) / 3
+            return res
+
+        def grad_mm_multipole(Tija, Tijab, Tijabc,
+                              qm_charges, qm_dipoles, qm_quads,
+                              mm_charges):
+            Tc  = lib.einsum('i,ijx->jx', qm_charges, Tija)
+            Tc += lib.einsum('ia,ijxa->jx', qm_dipoles, Tijab)
+            Tc += lib.einsum('iab,ijxab->jx', qm_quads, Tijabc) / 3
+            return lib.einsum('jx,j->jx', Tc, mm_charges)
+
+        #------ qm - mm clasiical ewald energy gradient ------#
+        all_mm_coords = (mm_coords[None,:,:] - Lall[:,None,:]).reshape(-1,3)
+        all_mm_charges = numpy.hstack([mm_charges] * len(Lall))
+        dist2 = all_mm_coords - numpy.mean(qm_coords, axis=0)[None]
+        dist2 = lib.einsum('jx,jx->j', dist2, dist2)
+        if with_mm:
+            mm_ewovrl_grad = numpy.zeros_like(all_mm_coords)
+        max_memory = mol.max_memory - lib.current_memory()[0]
+        nao = mol.nao
+        blksize = int(min(max_memory*1e6/8/nao**2/3, 200))
+        if blksize == 0:
+            raise RuntimeError(f"Not enough memory, max_memory = {max_memory}, blkszie = {blksize}")
+        for i0, i1 in lib.prange(0, mol.natm, blksize):
+            R = qm_coords[i0:i1,None,:] - all_mm_coords[None,:,:]
+            r = numpy.linalg.norm(R, axis=-1)
+            r[r<1e-16] = numpy.inf
+
+            # subtract the real-space Coulomb within rcut_hcore
+            mask = dist2 <= cell.rcut_hcore**2
+            Tija, Tijab, Tijabc = grad_Tij(R[:,mask], r[:,mask])
+            qm_ewovrl_grad[i0:i1] -= grad_qm_multipole(Tija, Tijab, Tijabc,
+                    qm_charges[i0:i1], qm_dipoles[i0:i1], qm_quads[i0:i1], all_mm_charges[mask])
+            if with_mm:
+                mm_ewovrl_grad[mask] += grad_mm_multipole(Tija, Tijab, Tijabc,
+                        qm_charges[i0:i1], qm_dipoles[i0:i1], qm_quads[i0:i1], all_mm_charges[mask])
+
+            # difference between MM gaussain charges and MM point charges
+            mask = dist2 > cell.rcut_hcore**2
+            zetas = cell.get_zetas()
+            min_expnt = numpy.min(zetas)
+            max_ewrcut = pbc.gto.cell._estimate_rcut(min_expnt, 0, 1., cell.precision)
+            cut2 = (max_ewrcut + rmax_qm)**2
+            mask = mask & (dist2 <= cut2)
+            if mol.mm_mol_pbc.charge_model == 'gaussian':
+                expnts = numpy.hstack([numpy.sqrt(zetas)] * len(Lall))[mask]
+            else:
+                expnts = numpy.full(len(cell.atom_coords()) * len(Lall), numpy.sqrt(zetas))[mask]
+            if expnts.size != 0:
+                Tija, Tijab, Tijabc = grad_kTij(R[:,mask], r[:,mask], expnts)
+                qm_ewovrl_grad[i0:i1] -= grad_qm_multipole(Tija, Tijab, Tijabc,
+                        qm_charges[i0:i1], qm_dipoles[i0:i1], qm_quads[i0:i1], all_mm_charges[mask])
+                if with_mm:
+                    mm_ewovrl_grad[mask] += grad_mm_multipole(Tija, Tijab, Tijabc,
+                            qm_charges[i0:i1], qm_dipoles[i0:i1], qm_quads[i0:i1], all_mm_charges[mask])
+
+            # ewald real-space sum
+            cut2 = (ew_cut + rmax_qm)**2
+            mask = dist2 <= cut2
+            Tija, Tijab, Tijabc = grad_kTij(R[:,mask], r[:,mask], ew_eta)
+            qm_ewovrl_grad[i0:i1] += grad_qm_multipole(Tija, Tijab, Tijabc,
+                    qm_charges[i0:i1], qm_dipoles[i0:i1], qm_quads[i0:i1], all_mm_charges[mask])
+            if with_mm:
+                mm_ewovrl_grad[mask] -= grad_mm_multipole(Tija, Tijab, Tijabc,
+                        qm_charges[i0:i1], qm_dipoles[i0:i1], qm_quads[i0:i1], all_mm_charges[mask])
+
+        if with_mm:
+            mm_ewovrl_grad = mm_ewovrl_grad.reshape(len(Lall), -1, 3)
+            mm_ewovrl_grad = numpy.sum(mm_ewovrl_grad, axis=0)
+        all_mm_coords = all_mm_charges = None
+
+        #------ qm - qm clasiical ewald energy gradient ------#
+        R = qm_coords[:,None,:] - qm_coords[None,:,:]
+        r = numpy.sqrt(lib.einsum('ijx,ijx->ij', R, R))
+        r[r<1e-16] = 1e100
+
+        # subtract the real-space Coulomb within rcut_hcore
+        Tija, Tijab, Tijabc = grad_Tij(R, r)
+        #qm_ewovrl_grad -= cp.einsum('i,ijx,j->ix', qm_charges, Tija, qm_charges)
+        #qm_ewovrl_grad += cp.einsum('i,ijxa,ja->ix', qm_charges, Tijab, qm_dipoles)
+        #qm_ewovrl_grad -= cp.einsum('i,ijxa,ja->jx', qm_charges, Tijab, qm_dipoles) #
+        #qm_ewovrl_grad += cp.einsum('ia,ijxab,jb->ix', qm_dipoles, Tijabc, qm_dipoles)
+        #qm_ewovrl_grad -= cp.einsum('i,ijxab,jab->ix', qm_charges, Tijabc, qm_quads) / 3
+        #qm_ewovrl_grad += cp.einsum('i,ijxab,jab->jx', qm_charges, Tijabc, qm_quads) / 3 #
+        temp = lib.einsum('ijx,j->ix', Tija, qm_charges)
+        qm_ewovrl_grad -= lib.einsum('i,ix->ix', qm_charges, temp)
+        temp = lib.einsum('ijxa,ja->ix', Tijab, qm_dipoles)
+        qm_ewovrl_grad += lib.einsum('i,ix->ix', qm_charges, temp)
+        temp = lib.einsum('i,ijxa->jxa', qm_charges, Tijab)
+        qm_ewovrl_grad -= lib.einsum('jxa,ja->jx', temp, qm_dipoles) #
+        temp = lib.einsum('ijxab,jb->ixa', Tijabc, qm_dipoles)
+        qm_ewovrl_grad += lib.einsum('ia,ixa->ix', qm_dipoles, temp)
+        temp = lib.einsum('ijxab,jab->ix', Tijabc, qm_quads)
+        qm_ewovrl_grad -= lib.einsum('i,ix->ix', qm_charges, temp) / 3
+        temp = lib.einsum('ijxab,jab->ijx', Tijabc, qm_quads)
+        qm_ewovrl_grad += lib.einsum('i,ijx->jx', qm_charges, temp) / 3 #
+        temp = None
+
+        # ewald real-space sum
+        # NOTE here I assume ewald real-space sum is over all qm images
+        # consistent with mm_mole.get_ewald_pot
+        R = (R[:,:,None,:] - Lall[None,None]).reshape(len(qm_coords), len(Lall)*len(qm_coords), 3)
+        r = numpy.sqrt(lib.einsum('ijx,ijx->ij', R, R))
+        r[r<1e-16] = 1e100
+        Tija, Tijab, Tijabc = grad_kTij(R, r, ew_eta)
+        Tija = Tija.reshape(len(qm_coords), len(qm_coords), len(Lall), 3)
+        Tijab = Tijab.reshape(len(qm_coords), len(qm_coords), len(Lall), 3, 3)
+        Tijabc = Tijabc.reshape(len(qm_coords), len(qm_coords), len(Lall), 3, 3, 3)
+        #qm_ewovrl_grad += cp.einsum('i,ijLx,j->ix', qm_charges, Tija, qm_charges)
+        #qm_ewovrl_grad -= cp.einsum('i,ijLxa,ja->ix', qm_charges, Tijab, qm_dipoles)
+        #qm_ewovrl_grad += cp.einsum('i,ijLxa,ja->jx', qm_charges, Tijab, qm_dipoles) #
+        #qm_ewovrl_grad -= cp.einsum('ia,ijLxab,jb->ix', qm_dipoles, Tijabc, qm_dipoles)
+        #qm_ewovrl_grad += cp.einsum('i,ijLxab,jab->ix', qm_charges, Tijabc, qm_quads) / 3
+        #qm_ewovrl_grad -= cp.einsum('i,ijLxab,jab->jx', qm_charges, Tijabc, qm_quads) / 3 #
+        temp = lib.einsum('ijLx,j->ix', Tija, qm_charges)
+        qm_ewovrl_grad += lib.einsum('i,ix->ix', qm_charges, temp)
+        temp = lib.einsum('ijLxa,ja->ix', Tijab, qm_dipoles)
+        qm_ewovrl_grad -= lib.einsum('i,ix->ix', qm_charges, temp)
+        temp = lib.einsum('i,ijLxa->jxa', qm_charges, Tijab)
+        qm_ewovrl_grad += lib.einsum('jxa,ja->jx', temp, qm_dipoles) #
+        temp = lib.einsum('ijLxab,jb->ixa', Tijabc, qm_dipoles)
+        qm_ewovrl_grad -= lib.einsum('ia,ixa->ix', qm_dipoles, temp)
+        temp = lib.einsum('ijLxab,jab->ix', Tijabc, qm_quads)
+        qm_ewovrl_grad += lib.einsum('i,ix->ix', qm_charges, temp) / 3
+        temp = lib.einsum('i,ijLxab->jxab', qm_charges, Tijabc)
+        qm_ewovrl_grad -= lib.einsum('jxab,jab->jx', temp, qm_quads) / 3 #
+
+        cput2 = logger.timer(self, 'grad_ewald real-space', *cput1)
+
+        # ---------------------------------------------- #
+        # ---------- Ewald k-space gradient ------------ #
+        # ---------------------------------------------- #
+
+        mesh = cell.mesh
+        Gv, Gvbase, weights = cell.get_Gv_weights(mesh)
+        absG2 = lib.einsum('gi,gi->g', Gv, Gv)
+        absG2[absG2==0] = 1e200
+        coulG = 4*numpy.pi / absG2
+        coulG *= weights
+        Gpref = numpy.exp(-absG2/(4*ew_eta**2)) * coulG
+
+        GvRmm = lib.einsum('gx,ix->ig', Gv, mm_coords)
+        cosGvRmm = numpy.cos(GvRmm)
+        sinGvRmm = numpy.sin(GvRmm)
+        zcosGvRmm = lib.einsum("i,ig->g", mm_charges, cosGvRmm)
+        zsinGvRmm = lib.einsum("i,ig->g", mm_charges, sinGvRmm)
+
+        GvRqm = lib.einsum('gx,ix->ig', Gv, qm_coords)
+        cosGvRqm = numpy.cos(GvRqm)
+        sinGvRqm = numpy.sin(GvRqm)
+        zcosGvRqm = lib.einsum("i,ig->g", qm_charges, cosGvRqm)
+        zsinGvRqm = lib.einsum("i,ig->g", qm_charges, sinGvRqm)
+        #DGcosGvRqm = cp.einsum("ia,ga,ig->g", qm_dipoles, Gv, cosGvRqm)
+        #DGsinGvRqm = cp.einsum("ia,ga,ig->g", qm_dipoles, Gv, sinGvRqm)
+        #TGGcosGvRqm = cp.einsum("iab,ga,gb,ig->g", qm_quads, Gv, Gv, cosGvRqm)
+        #TGGsinGvRqm = cp.einsum("iab,ga,gb,ig->g", qm_quads, Gv, Gv, sinGvRqm)
+        temp = lib.einsum('ia,ig->ag', qm_dipoles, cosGvRqm)
+        DGcosGvRqm = lib.einsum('ga,ag->g', Gv, temp)
+        temp = lib.einsum('ia,ig->ag', qm_dipoles, sinGvRqm)
+        DGsinGvRqm = lib.einsum('ga,ag->g', Gv, temp)
+        temp = lib.einsum('iab,ig->abg', qm_quads, cosGvRqm)
+        temp = lib.einsum('abg,ga->bg', temp, Gv)
+        TGGcosGvRqm = lib.einsum('gb,bg->g', Gv, temp)
+        temp = lib.einsum('iab,ig->abg', qm_quads, sinGvRqm)
+        temp = lib.einsum('abg,ga->bg', temp, Gv)
+        TGGsinGvRqm = lib.einsum('gb,bg->g', Gv, temp)
+
+        qm_ewg_grad = numpy.zeros_like(qm_coords)
+        if with_mm:
+            mm_ewg_grad = numpy.zeros_like(mm_coords)
+
+        # qm pc - mm pc
+        #p = ['einsum_path', (3, 4), (1, 3), (1, 2), (0, 1)]
+        #qm_ewg_grad -= cp.einsum('i,gx,ig,g,g->ix', qm_charges, Gv, sinGvRqm, zcosGvRmm, Gpref, optimize=p)
+        #qm_ewg_grad += cp.einsum('i,gx,ig,g,g->ix', qm_charges, Gv, cosGvRqm, zsinGvRmm, Gpref, optimize=p)
+        temp = lib.einsum('g,g->g', zcosGvRmm, Gpref)
+        temp = lib.einsum('gx,g->gx', Gv, temp)
+        temp = lib.einsum('ig,gx->ix', sinGvRqm, temp)
+        qm_ewg_grad -= lib.einsum('i,ix->ix', qm_charges, temp)
+        temp = lib.einsum('g,g->g', zsinGvRmm, Gpref)
+        temp = lib.einsum('gx,g->gx', Gv, temp)
+        temp = lib.einsum('ig,gx->ix', cosGvRqm, temp)
+        qm_ewg_grad += lib.einsum('i,ix->ix', qm_charges, temp)
+        if with_mm:
+            #p = ['einsum_path', (0, 2), (1, 2), (0, 2), (0, 1)]
+            #mm_ewg_grad -= cp.einsum('i,gx,ig,g,g->ix', mm_charges, Gv, sinGvRmm, zcosGvRqm, Gpref, optimize=p)
+            #mm_ewg_grad += cp.einsum('i,gx,ig,g,g->ix', mm_charges, Gv, cosGvRmm, zsinGvRqm, Gpref, optimize=p)
+            temp = lib.einsum('i,ig->gi', mm_charges, sinGvRmm)
+            temp2 = lib.einsum('g,g->g', zcosGvRqm, Gpref)
+            temp2 = lib.einsum('gx,g->gx', Gv, temp2)
+            mm_ewg_grad -= lib.einsum('gi,gx->ix', temp, temp2)
+            temp = lib.einsum('i,ig->gi', mm_charges, cosGvRmm)
+            temp2 = lib.einsum('g,g->g', zsinGvRqm, Gpref)
+            temp2 = lib.einsum('gx,g->gx', Gv, temp2)
+            mm_ewg_grad += lib.einsum('gi,gx->ix', temp, temp2)
+        # qm dip - mm pc
+        #p = ['einsum_path', (4, 5), (1, 4), (0, 1), (0, 2), (0, 1)]
+        #qm_ewg_grad -= cp.einsum('ia,gx,ga,ig,g,g->ix', qm_dipoles, Gv, Gv, sinGvRqm, zsinGvRmm, Gpref, optimize=p)
+        #qm_ewg_grad -= cp.einsum('ia,gx,ga,ig,g,g->ix', qm_dipoles, Gv, Gv, cosGvRqm, zcosGvRmm, Gpref, optimize=p)
+        temp = lib.einsum('g,g->g', zsinGvRmm, Gpref)
+        temp = lib.einsum('gx,g->gx', Gv, temp)
+        temp2 = lib.einsum('ia,ga->gi', qm_dipoles, Gv)
+        temp2 = lib.einsum('ig,gi->ig', sinGvRqm, temp2)
+        qm_ewg_grad -= lib.einsum('gx,ig->ix', temp, temp2)
+        temp = lib.einsum('g,g->g', zcosGvRmm, Gpref)
+        temp = lib.einsum('gx,g->gx', Gv, temp)
+        temp2 = lib.einsum('ia,ga->gi', qm_dipoles, Gv)
+        temp2 = lib.einsum('ig,gi->ig', cosGvRqm, temp2)
+        qm_ewg_grad -= lib.einsum('gx,ig->ix', temp, temp2)
+        if with_mm:
+            #p = ['einsum_path', (1, 3), (0, 2), (0, 2), (0, 1)]
+            #mm_ewg_grad += cp.einsum('g,j,gx,jg,g->jx', DGcosGvRqm, mm_charges, Gv, cosGvRmm, Gpref, optimize=p)
+            #mm_ewg_grad += cp.einsum('g,j,gx,jg,g->jx', DGsinGvRqm, mm_charges, Gv, sinGvRmm, Gpref, optimize=p)
+            temp = lib.einsum('j,jg->gj', mm_charges, cosGvRmm)
+            temp2 = lib.einsum('g,g->g', DGcosGvRqm, Gpref)
+            temp2 = lib.einsum('gx,g->gx', Gv, temp2)
+            mm_ewg_grad += lib.einsum('gj,gx->jx', temp, temp2)
+            temp = lib.einsum('j,jg->gj', mm_charges, sinGvRmm)
+            temp2 = lib.einsum('g,g->g', DGsinGvRqm, Gpref)
+            temp2 = lib.einsum('gx,g->gx', Gv, temp2)
+            mm_ewg_grad += lib.einsum('gj,gx->jx', temp, temp2)
+        # qm quad - mm pc
+        #p = ['einsum_path', (5, 6), (0, 5), (0, 2), (2, 3), (1, 2), (0, 1)]
+        #qm_ewg_grad += cp.einsum('ga,gb,iab,gx,ig,g,g->ix',\
+        # Gv, Gv, qm_quads, Gv, sinGvRqm, zcosGvRmm, Gpref, optimize=p) / 3
+        #qm_ewg_grad -= cp.einsum('ga,gb,iab,gx,ig,g,g->ix',\
+        # Gv, Gv, qm_quads, Gv, cosGvRqm, zsinGvRmm, Gpref, optimize=p) / 3
+        temp = lib.einsum('g,g->g', zcosGvRmm, Gpref)
+        temp = lib.einsum('ga,g->ag', Gv, temp)
+        temp2 = lib.einsum('gb,gx->gbx', Gv, Gv)
+        temp = lib.einsum('ag,gbx->abgx', temp, temp2)
+        temp = lib.einsum('ig,abgx->iabx', sinGvRqm, temp)
+        qm_ewg_grad += lib.einsum('iab,iabx->ix', qm_quads, temp) / 3
+        temp = lib.einsum('g,g->g', zsinGvRmm, Gpref)
+        temp = lib.einsum('ga,g->ag', Gv, temp)
+        temp2 = lib.einsum('gb,gx->gbx', Gv, Gv)
+        temp = lib.einsum('ag,gbx->abgx', temp, temp2)
+        temp = lib.einsum('ig,abgx->iabx', cosGvRqm, temp)
+        qm_ewg_grad -= lib.einsum('iab,iabx->ix', qm_quads, temp) / 3
+        if with_mm:
+            #p = ['einsum_path', (1, 3), (0, 2), (0, 2), (0, 1)]
+            #mm_ewg_grad += cp.einsum('g,j,gx,jg,g->jx',\
+            # TGGcosGvRqm, mm_charges, Gv, sinGvRmm, Gpref, optimize=p) / 3
+            #mm_ewg_grad -= cp.einsum('g,j,gx,jg,g->jx',\
+            # TGGsinGvRqm, mm_charges, Gv, cosGvRmm, Gpref, optimize=p) / 3
+            temp = lib.einsum('j,jg->gj', mm_charges, sinGvRmm)
+            temp2 = lib.einsum('g,g->g', TGGcosGvRqm, Gpref)
+            temp2 = lib.einsum('gx,g->gx', Gv, temp2)
+            mm_ewg_grad += lib.einsum('gj,gx->jx', temp, temp2) / 3
+            temp = lib.einsum('j,jg->gj', mm_charges, cosGvRmm)
+            temp2 = lib.einsum('g,g->g', TGGsinGvRqm, Gpref)
+            temp2 = lib.einsum('gx,g->gx', Gv, temp2)
+            mm_ewg_grad -= lib.einsum('gj,gx->jx', temp, temp2) / 3
+
+        # qm pc - qm pc
+        #p = ['einsum_path', (3, 4), (1, 3), (1, 2), (0, 1)]
+        #qm_ewg_grad -= cp.einsum('i,gx,ig,g,g->ix', qm_charges, Gv, sinGvRqm, zcosGvRqm, Gpref, optimize=p)
+        #qm_ewg_grad += cp.einsum('i,gx,ig,g,g->ix', qm_charges, Gv, cosGvRqm, zsinGvRqm, Gpref, optimize=p)
+        temp = lib.einsum('g,g->g', zcosGvRqm, Gpref)
+        temp = lib.einsum('gx,g->gx', Gv, temp)
+        temp = lib.einsum('ig,gx->ix', sinGvRqm, temp)
+        qm_ewg_grad -= lib.einsum('i,ix->ix', qm_charges, temp)
+        temp = lib.einsum('g,g->g', zsinGvRqm, Gpref)
+        temp = lib.einsum('gx,g->gx', Gv, temp)
+        temp = lib.einsum('ig,gx->ix', cosGvRqm, temp)
+        qm_ewg_grad += lib.einsum('i,ix->ix', qm_charges, temp)
+        # qm pc - qm dip
+        #qm_ewg_grad += cp.einsum('i,gx,ig,g,g->ix', qm_charges, Gv, cosGvRqm, DGcosGvRqm, Gpref, optimize=p)
+        #qm_ewg_grad += cp.einsum('i,gx,ig,g,g->ix', qm_charges, Gv, sinGvRqm, DGsinGvRqm, Gpref, optimize=p)
+        temp = lib.einsum('g,g->g', DGcosGvRqm, Gpref)
+        temp = lib.einsum('gx,g->gx', Gv, temp)
+        temp = lib.einsum('ig,gx->ix', cosGvRqm, temp)
+        qm_ewg_grad += lib.einsum('i,ix->ix', qm_charges, temp)
+        temp = lib.einsum('g,g->g', DGsinGvRqm, Gpref)
+        temp = lib.einsum('gx,g->gx', Gv, temp)
+        temp = lib.einsum('ig,gx->ix', sinGvRqm, temp)
+        qm_ewg_grad += lib.einsum('i,ix->ix', qm_charges, temp)
+        #p = ['einsum_path', (3, 5), (1, 4), (1, 3), (1, 2), (0, 1)]
+        #qm_ewg_grad -= cp.einsum('ja,ga,gx,g,jg,g->jx', qm_dipoles, Gv, Gv, zsinGvRqm, sinGvRqm, Gpref, optimize=p)
+        #qm_ewg_grad -= cp.einsum('ja,ga,gx,g,jg,g->jx', qm_dipoles, Gv, Gv, zcosGvRqm, cosGvRqm, Gpref, optimize=p)
+        temp = lib.einsum('g,g->g', zsinGvRqm, Gpref)
+        temp = lib.einsum('ga,g->ag', Gv, temp)
+        temp = lib.einsum('gx,ag->axg', Gv, temp)
+        temp = lib.einsum('jg,axg->ajx', sinGvRqm, temp)
+        qm_ewg_grad -= lib.einsum('ja,ajx->jx', qm_dipoles, temp)
+        temp = lib.einsum('g,g->g', zcosGvRqm, Gpref)
+        temp = lib.einsum('ga,g->ag', Gv, temp)
+        temp = lib.einsum('gx,ag->axg', Gv, temp)
+        temp = lib.einsum('jg,axg->ajx', cosGvRqm, temp)
+        qm_ewg_grad -= lib.einsum('ja,ajx->jx', qm_dipoles, temp)
+        # qm dip - qm dip
+        #p = ['einsum_path', (4, 5), (1, 4), (1, 3), (1, 2), (0, 1)]
+        #qm_ewg_grad -= cp.einsum('ia,ga,gx,ig,g,g->ix', qm_dipoles, Gv, Gv, sinGvRqm, DGcosGvRqm, Gpref, optimize=p)
+        #qm_ewg_grad += cp.einsum('ia,ga,gx,ig,g,g->ix', qm_dipoles, Gv, Gv, cosGvRqm, DGsinGvRqm, Gpref, optimize=p)
+        temp = lib.einsum('g,g->g', DGcosGvRqm, Gpref)
+        temp = lib.einsum('ga,g->ag', Gv, temp)
+        temp = lib.einsum('gx,ag->axg', Gv, temp)
+        temp = lib.einsum('ig,axg->aix', sinGvRqm, temp)
+        qm_ewg_grad -= lib.einsum('ia,aix->ix', qm_dipoles, temp)
+        temp = lib.einsum('g,g->g', DGsinGvRqm, Gpref)
+        temp = lib.einsum('ga,g->ag', Gv, temp)
+        temp = lib.einsum('gx,ag->axg', Gv, temp)
+        temp = lib.einsum('ig,axg->aix', cosGvRqm, temp)
+        qm_ewg_grad += lib.einsum('ia,aix->ix', qm_dipoles, temp)
+        # qm pc - qm quad
+        #p = ['einsum_path', (3, 4), (1, 3), (1, 2), (0, 1)]
+        #qm_ewg_grad += cp.einsum('i,gx,ig,g,g->ix', qm_charges, Gv, sinGvRqm, TGGcosGvRqm, Gpref, optimize=p) / 3
+        #qm_ewg_grad -= cp.einsum('i,gx,ig,g,g->ix', qm_charges, Gv, cosGvRqm, TGGsinGvRqm, Gpref, optimize=p) / 3
+        temp = lib.einsum('g,g->g', TGGcosGvRqm, Gpref)
+        temp = lib.einsum('gx,g->gx', Gv, temp)
+        temp = lib.einsum('ig,gx->ix', sinGvRqm, temp)
+        qm_ewg_grad += lib.einsum('i,ix->ix', qm_charges, temp) / 3
+        temp = lib.einsum('g,g->g', TGGsinGvRqm, Gpref)
+        temp = lib.einsum('gx,g->gx', Gv, temp)
+        temp = lib.einsum('ig,gx->ix', cosGvRqm, temp)
+        qm_ewg_grad -= lib.einsum('i,ix->ix', qm_charges, temp) / 3
+        #p = ['einsum_path', (4, 6), (1, 5), (1, 2), (2, 3), (1, 2), (0, 1)]
+        #qm_ewg_grad += cp.einsum('jab,ga,gb,gx,g,jg,g->jx',\
+        # qm_quads, Gv, Gv, Gv, zcosGvRqm, sinGvRqm, Gpref, optimize=p) / 3
+        #qm_ewg_grad -= cp.einsum('jab,ga,gb,gx,g,jg,g->jx',\
+        # qm_quads, Gv, Gv, Gv, zsinGvRqm, cosGvRqm, Gpref, optimize=p) / 3
+        temp = lib.einsum('g,g->g', zcosGvRqm, Gpref)
+        temp = lib.einsum('ga,g->ag', Gv, temp)
+        temp2 = lib.einsum('gb,gx->bgx', Gv, Gv)
+        temp = lib.einsum('ag,bgx->abgx', temp, temp2)
+        temp = lib.einsum('jg,abgx->abjx', sinGvRqm, temp)
+        qm_ewg_grad += lib.einsum('jab,abjx->jx', qm_quads, temp) / 3
+        temp = lib.einsum('g,g->g', zsinGvRqm, Gpref)
+        temp = lib.einsum('ga,g->ag', Gv, temp)
+        temp2 = lib.einsum('gb,gx->bgx', Gv, Gv)
+        temp = lib.einsum('ag,bgx->abgx', temp, temp2)
+        temp = lib.einsum('jg,abgx->abjx', cosGvRqm, temp)
+        qm_ewg_grad -= lib.einsum('jab,abjx->jx', qm_quads, temp) / 3
+
+        logger.timer(self, 'grad_ewald k-space', *cput2)
+        logger.timer(self, 'grad_ewald', *cput0)
+        if not with_mm:
+            return qm_multipole_grad + qm_ewovrl_grad + qm_ewg_grad
+        else:
+            return qm_multipole_grad + qm_ewovrl_grad + qm_ewg_grad, \
+                   mm_ewovrl_grad + mm_ewg_grad
+
     grad = lib.alias(kernel, alias_name='grad')
 
     grad_int = grad_int
     grad_epc = grad_epc
     grad_hcore_mm = grad_hcore_mm
+    grad_hcore_mm_pbc = grad_hcore_mm_pbc
     grad_nuc_mm = grad_nuc_mm
+    grad_nuc_mm_pbc = grad_nuc_mm_pbc
 
     def grad_mm(self, dm=None, mol=None):
-        return self.grad_hcore_mm(dm, mol) + self.grad_nuc_mm(mol)
+        if self.base.mol.mm_mol is not None:
+            g_mm = self.grad_hcore_mm(dm, mol) + self.grad_nuc_mm(mol)
+        elif self.base.mol.mm_mol_pbc is not None:
+            g_mm = self.grad_hcore_mm_pbc(dm, mol) + self.grad_nuc_mm_pbc(mol)
+            g_mm += self.de_ewald_mm
+        return g_mm
+
+    def _finalize(self):
+        if self.base.mol.mm_mol_pbc is not None:
+            g_ewald_qm, self.de_ewald_mm = self.grad_ewald(with_mm=True)
+            self.de += g_ewald_qm
+        super()._finalize()
+
 
     as_scanner = as_scanner
 

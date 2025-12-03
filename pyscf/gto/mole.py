@@ -1276,7 +1276,7 @@ def dumps(mol):
                     # Constructing in function loads
                     'symm_orb', 'irrep_id', 'irrep_name',
                     # Multicomponent and its QMMM
-                    'components', 'mm_mol'}
+                    'components', 'mm_mol', 'mm_mol_pbc'}
     moldic = dict(mol.__dict__)
     for k in exclude_keys:
         if k in moldic:
