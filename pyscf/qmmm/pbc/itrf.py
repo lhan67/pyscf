@@ -185,7 +185,7 @@ class QMMMSCF(QMMM):
     #     ewpot10 = lib.einsum('ijx,i->jx', qm_ewald_hess[1], charges)
     #     ewpot11 = lib.einsum('ijxy,jy->ix', qm_ewald_hess[2], dips)
     #     ewpot20 = lib.einsum('ijxy,j->ixy', qm_ewald_hess[3], charges)
-    #     return ewpot00, ewpot01, ewpot02, ewpot10, ewpot11, ewpot20, 
+    #     return ewpot00, ewpot01, ewpot02, ewpot10, ewpot11, ewpot20,
 
     def get_hcore(self, mol=None):
         cput0 = (logger.process_clock(), logger.perf_counter())
@@ -775,7 +775,7 @@ class QMMMGrad:
                 # d E_qm_pc / d Ri with fixed ewald_pot
                 qm_multipole_grad[jatm] += \
                     lib.einsum('uv,xuv->x', dEds[p0:p1], s1[:,p0:p1]) \
-                - lib.einsum('uv,xuv->x', dEds[:,p0:p1], s1[:,:,p0:p1])
+                  - lib.einsum('uv,xuv->x', dEds[:,p0:p1], s1[:,:,p0:p1])
 
                 # d E_qm_dip / d Ri
                 qm_multipole_grad[jatm] -= \
@@ -875,11 +875,13 @@ class QMMMGrad:
 
                 _UTBTS1BU = []
                 for i_xyz in range(3):
-                    _UTBTS1BU.append(reduce(np.dot, (U_eigenvectors.conj().T, B_pre_orth.conj().T, _s1[i_xyz], \
-                        B_pre_orth, U_eigenvectors)))
+                    _UTBTS1BU.append(reduce(np.dot, (
+                        U_eigenvectors.conj().T, B_pre_orth.conj().T, _s1[i_xyz],B_pre_orth, U_eigenvectors)))
                 _UTBTS1BU = np.asarray(_UTBTS1BU)
-                dS_proj_half_dR = lib.einsum('ia,xab,ab,bj->xij', U_eigenvectors, _UTBTS1BU, S_sqrt_1, U_eigenvectors.conj().T)
-                dS_proj_half_inv_dR = -lib.einsum('ia,xab,ab,bj->xij', U_eigenvectors, _UTBTS1BU, S_sqrt_2, U_eigenvectors.conj().T)
+                dS_proj_half_dR = lib.einsum('ia,xab,ab,bj->xij',
+                    U_eigenvectors, _UTBTS1BU, S_sqrt_1, U_eigenvectors.conj().T)
+                dS_proj_half_inv_dR = -lib.einsum('ia,xab,ab,bj->xij',
+                    U_eigenvectors, _UTBTS1BU, S_sqrt_2, U_eigenvectors.conj().T)
                 dA_inv_dR = []
                 dA_dR = []
                 for i_xyz in range(3):
@@ -904,17 +906,23 @@ class QMMMGrad:
                     _v1 = v1[katm]
                     _p0, _p1 = aoslices[katm, 2:]
                     qm_multipole_grad[jatm] -= \
-                        lib.einsum('e,xab,bu,euv,va->x', _v1, dA_inv_dR[:,_p0:_p1], dm, s1r_reg[katm], AO_orth[:,_p0:_p1]) \
-                      + lib.einsum('e,ab,bu,exuv,va->x', _v1, CO_orth[_p0:_p1], dm, _s1r[katm], AO_orth[:,_p0:_p1]) \
-                      + lib.einsum('e,ab,bu,euv,xva->x', _v1, CO_orth[_p0:_p1], dm, s1r_reg[katm], dA_dR[...,_p0:_p1])
+                        lib.einsum('e,xab,bu,euv,va->x',
+                            _v1, dA_inv_dR[:,_p0:_p1], dm, s1r_reg[katm], AO_orth[:,_p0:_p1]) \
+                      + lib.einsum('e,ab,bu,exuv,va->x',
+                            _v1, CO_orth[_p0:_p1], dm, _s1r[katm], AO_orth[:,_p0:_p1]) \
+                      + lib.einsum('e,ab,bu,euv,xva->x',
+                            _v1, CO_orth[_p0:_p1], dm, s1r_reg[katm], dA_dR[...,_p0:_p1])
 
                 for katm in range(mol.natm):
                     _v2 = v2[katm]
                     _p0, _p1 = aoslices[katm, 2:]
                     qm_multipole_grad[jatm] -= \
-                        lib.einsum('eg,xab,bu,eguv,va->x', _v2, dA_inv_dR[:,_p0:_p1], dm, s1rr_reg[katm], AO_orth[:,_p0:_p1]) \
-                      + lib.einsum('eg,ab,bu,egxuv,va->x', _v2, CO_orth[_p0:_p1], dm, _s1rr[katm], AO_orth[:,_p0:_p1]) \
-                      + lib.einsum('eg,ab,bu,eguv,xva->x', _v2, CO_orth[_p0:_p1], dm, s1rr_reg[katm], dA_dR[...,_p0:_p1])
+                        lib.einsum('eg,xab,bu,eguv,va->x',
+                            _v2, dA_inv_dR[:,_p0:_p1], dm, s1rr_reg[katm], AO_orth[:,_p0:_p1]) \
+                      + lib.einsum('eg,ab,bu,egxuv,va->x',
+                            _v2, CO_orth[_p0:_p1], dm, _s1rr[katm], AO_orth[:,_p0:_p1]) \
+                      + lib.einsum('eg,ab,bu,eguv,xva->x',
+                            _v2, CO_orth[_p0:_p1], dm, s1rr_reg[katm], dA_dR[...,_p0:_p1])
 
         else:
             raise NotImplementedError(f'Analytical gradient has not been applied on \
