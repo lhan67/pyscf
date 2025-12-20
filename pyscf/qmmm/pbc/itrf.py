@@ -272,7 +272,8 @@ class QMMMSCF(QMMM):
             if self.AO_orth is None or self.CO_orth is None:
                 cput0 = (logger.process_clock(), logger.perf_counter())
                 S = self.get_ovlp()
-                AO_orth = orth.orth_ao(self.mol, method=pop_method, s=S)
+                AO_orth = orth.orth_ao(self.mol, method=pop_method, s=S,
+                                       pre_orth_ao=self.pre_orth_ao)
                 CO_orth = np.linalg.inv(AO_orth)
                 self.AO_orth = AO_orth
                 self.CO_orth = CO_orth
@@ -743,9 +744,9 @@ class QMMMGrad:
             s1rr = list()
             bas_atom = mol._bas[:,gto.ATOM_OF]
             for iatm in range(mol.natm):
-                v0 = ewald_pot[0]
-                v1 = ewald_pot[1]
-                v2 = ewald_pot[2]
+                v0 = ewald_pot[0][iatm]
+                v1 = ewald_pot[1][iatm]
+                v2 = ewald_pot[2][iatm]
                 p0, p1 = aoslices[iatm, 2:]
 
                 dEds[p0:p1] -= v0 * dm[p0:p1]
@@ -803,7 +804,9 @@ class QMMMGrad:
             s1r = list()
             s1rr = list()
 
-            if not isinstance(self.base.pre_orth_ao, np.ndarray):
+            if self.base.pre_orth_ao is None:
+                B_pre_orth = np.eye(mol.nao)
+            elif not isinstance(self.base.pre_orth_ao, np.ndarray):
                 B_pre_orth = orth.restore_ao_character(mol, method=self.base.pre_orth_ao)
             else:
                 B_pre_orth = self.base.pre_orth_ao
