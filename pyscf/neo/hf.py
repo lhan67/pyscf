@@ -4,7 +4,6 @@
 Nuclear Electronic Orbital Hartree-Fock (NEO-HF)
 '''
 
-import copy
 import ctypes
 import h5py
 import numpy
@@ -296,6 +295,7 @@ def general_scf(method, charge=1, mass=1, is_nucleus=False, nuc_occ_state=0):
         method.mass = mass
         method.is_nucleus = is_nucleus
         method.nuc_occ_state = nuc_occ_state
+        method._vint = None
         return method
     return lib.set_class(ComponentSCF(method, charge, mass, is_nucleus, nuc_occ_state),
                          (ComponentSCF, method.__class__))
@@ -315,6 +315,7 @@ class ComponentSCF(Component):
 
     def undo_component(self):
         obj = lib.view(self, lib.drop_class(self.__class__, Component))
+        del obj.charge, obj.mass, obj.is_nucleus, obj.nuc_occ_state, obj._vint
         return obj
 
     def get_hcore(self, mol=None):
@@ -615,6 +616,7 @@ class ComponentSCF(Component):
                 nmo = mo_energy.size
                 nocc = 1 # singly occupied nuclear orbital
                 mo_occ[e_idx[self.nuc_occ_state]] = self.mol.nnuc # 1 or fractional
+                assert nocc <= nmo
                 if self.verbose >= logger.INFO and nocc < nmo:
                     if e_sort[nocc-1]+1e-3 > e_sort[nocc]:
                         logger.warn(self, 'CNEO NUC HOMO %.15g == LUMO %.15g',
@@ -651,6 +653,9 @@ class ComponentSCF(Component):
                     mo_occ[1,e_idx_b[:n_b - 1]] = 1
                     mo_occ[1,e_idx_b[n_b - 1]] = self.mol.nhomo
                     mo_occ[0,e_idx_a[:n_a]] = 1
+                if n_a > nmo or n_b > nmo:
+                    raise RuntimeError('Failed to assign mo_occ. '
+                                       f'nelec ({n_a}, {n_b}) > Nmo ({nmo})')
                 if self.verbose >= logger.INFO and n_a < nmo and n_b > 0 and n_b < nmo:
                     if e_sort_a[n_a-1]+1e-3 > e_sort_a[n_a]:
                         logger.warn(self, 'alpha nocc = %d  HOMO %.15g >= LUMO %.15g',
@@ -757,22 +762,86 @@ def _build_eri(mol1, mol2, cart):
                                              size1, size1 + size2),
                                  aosym='s4')
 
+def _combine_dm(dm1, nao1, dm2, nao2):
+    # combine two dms into block-diagonal form
+    assert dm1 is not None or dm2 is not None
+
+    def _ndim(dm):
+        return 0 if dm is None else numpy.asarray(dm).ndim
+    ndim1 = _ndim(dm1)
+    ndim2 = _ndim(dm2)
+    if ndim1 and ndim2 and ndim1 != ndim2:
+        raise ValueError(f'dm1 has ndim={ndim1} but dm2 has ndim={ndim2}')
+    ndim = max(ndim1, ndim2, 2)
+
+    def _nset(dm):
+        if dm is None:
+            return 0
+        dm = numpy.asarray(dm)
+        if dm.ndim == 2:
+            return 1
+        elif dm.ndim == 3:
+            return dm.shape[0]
+        raise ValueError(f'Density matrix dimension must be 2 or 3, got {dm.ndim}')
+    n1 = _nset(dm1)
+    n2 = _nset(dm2)
+    if n1 and n2 and n1 != n2:
+        raise ValueError(f'dm1 has nset={n1} but dm2 has nset={n2}')
+    nset = max(n1, n2, 1)
+
+    nao = nao1 + nao2
+    if nset == 1 and ndim == 2:
+        dms = numpy.zeros((nao, nao))
+    else:
+        dms = numpy.zeros((nset, nao, nao))
+    if dm1 is not None:
+        dm1 = numpy.asarray(dm1)
+        if dm1.ndim == 2:
+            dms[..., :nao1, :nao1] = dm1
+        else:
+            dms[:, :nao1, :nao1] = dm1
+    if dm2 is not None:
+        dm2 = numpy.asarray(dm2)
+        if dm2.ndim == 2:
+            dms[..., nao1:, nao1:] = dm2
+        else:
+            dms[:, nao1:, nao1:] = dm2
+    return dms
+
 class InteractionCoulomb:
     '''Inter-component Coulomb interactions'''
-    def __init__(self, mf1_type, mf1, mf2_type, mf2, max_memory):
+    def __init__(self, mf1_type, mf1, mf2_type, mf2, max_memory, direct_scf_tol):
         self.mf1_type = mf1_type
         self.mf1 = mf1
         self.mf1_unrestricted = isinstance(self.mf1, scf.uhf.UHF)
         self.mf2_type = mf2_type
         self.mf2 = mf2
         self.mf2_unrestricted = isinstance(self.mf2, scf.uhf.UHF)
+        self.mol = self.mf1.mol + self.mf2.mol
         self.max_memory = max_memory
         self._eri = None # mol1: left; mol2: right
+        self.direct_scf_tol = direct_scf_tol
+        self._vhfopt = None
 
     def _is_mem_enough(self):
         nao1 = self.mf1.mol.nao_nr()
         nao2 = self.mf2.mol.nao_nr()
         return nao1**2*nao2**2*2/1e6+lib.current_memory()[0] < self.max_memory*.95
+
+    def _init_vhfopt(self):
+        opt = _vhf._VHFOpt(self.mol, 'int2e', 'CVHFnrs8_vj_prescreen',
+                           'CVHFnr_int2e_q_cond', None, self.direct_scf_tol)
+        return opt
+
+    def _vhfopt_set_dm(self, dm1, dm2):
+        nao1 = self.mf1.mol.nao_nr()
+        nao2 = self.mf2.mol.nao_nr()
+        dms = _combine_dm(dm1, nao1, dm2, nao2)
+
+        mol = self.mol
+        self._vhfopt._dmcondname = 'CVHFnr_dm_cond'
+        self._vhfopt.set_dm(dms, mol._atm, mol._bas, mol._env)
+        self._vhfopt._dmcondname = None # avoid set_dm in get_jk
 
     def get_vint(self, dm):
         '''Obtain vj for both components'''
@@ -816,24 +885,30 @@ class InteractionCoulomb:
                               +'might be slow. '
                               +f'PYSCF_MAX_MEMORY is set to {mol.max_memory} MB, '
                               +f'required memory: {mol1.nao**2*mol2.nao**2*2/1e6=:.2f} MB')
+            if self._vhfopt is None:
+                self._vhfopt = self._init_vhfopt()
+            self._vhfopt_set_dm(dm1, dm2)
             if dm1 is not None and dm2 is not None:
                 vj[self.mf1_type], vj[self.mf2_type] = \
                         scf.jk.get_jk((mol1, mol1, mol2, mol2),
                                       (dm2, dm1),
                                       scripts=('ijkl,lk->ij', 'ijkl,ji->kl'),
-                                      intor='int2e', aosym='s4')
+                                      intor='int2e', aosym='s4',
+                                      vhfopt=self._vhfopt)
             elif dm1 is not None:
                 vj[self.mf2_type] = \
                         scf.jk.get_jk((mol1, mol1, mol2, mol2),
                                       dm1,
                                       scripts='ijkl,ji->kl',
-                                      intor='int2e', aosym='s4')
+                                      intor='int2e', aosym='s4',
+                                      vhfopt=self._vhfopt)
             else:
                 vj[self.mf1_type] = \
                         scf.jk.get_jk((mol1, mol1, mol2, mol2),
                                       dm2,
                                       scripts='ijkl,lk->ij',
-                                      intor='int2e', aosym='s4')
+                                      intor='int2e', aosym='s4',
+                                      vhfopt=self._vhfopt)
         charge_product = self.mf1.charge * self.mf2.charge
         if self.mf1_type in vj:
             vj[self.mf1_type] *= charge_product
@@ -841,7 +916,8 @@ class InteractionCoulomb:
             vj[self.mf2_type] *= charge_product
         return vj
 
-def generate_interactions(components, interaction_class, max_memory, **kwagrs):
+def generate_interactions(components, interaction_class, max_memory,
+                          direct_scf_tol, **kwagrs):
     keys = sorted(components.keys())
 
     interactions = {}
@@ -850,7 +926,9 @@ def generate_interactions(components, interaction_class, max_memory, **kwagrs):
             if p1 != p2:
                 interaction = interaction_class(p1, components[p1],
                                                 p2, components[p2],
-                                                max_memory, **kwagrs)
+                                                max_memory,
+                                                direct_scf_tol,
+                                                **kwagrs)
                 interactions[(p1, p2)] = interaction
 
     return interactions
@@ -1095,6 +1173,8 @@ def kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
             scf_conv = mf.check_convergence(locals())
         elif abs(e_tot-last_hf_e) < conv_tol and norm_gorb['e'] < conv_tol_grad:
             scf_conv = True
+        else:
+            scf_conv = False
 
         if dump_chk and mf.chkfile:
             mf.dump_chk(locals())
@@ -1188,7 +1268,7 @@ class HF(scf.hf.SCF):
                     charge = -1.
                 self.components[t] = general_scf(mf, charge=charge)
         self.interactions = generate_interactions(self.components, InteractionCoulomb,
-                                                  self.max_memory)
+                                                  self.max_memory, self.direct_scf_tol)
         self.mm_ewald_pot = None
         self.qm_ewald_hess = None
 
@@ -1848,6 +1928,26 @@ class HF(scf.hf.SCF):
 
     as_scanner = as_scanner
 
+    def copy(self):
+        '''Shallow copy but special treatment for array/dict that may get in-place mutations'''
+        new = super().copy() # shallow copy
+
+        # Rebind attributes that will get in-place mutations
+        if hasattr(self, 'f') and self.f is not None:
+            new.f = numpy.array(self.f, copy=True)
+
+        new.components = {}
+        for t, comp in self.components.items():
+            new.components[t] = general_scf(comp.undo_component().copy(),
+                                            charge=comp.charge,
+                                            mass=comp.mass,
+                                            is_nucleus=comp.is_nucleus,
+                                            nuc_occ_state=comp.nuc_occ_state)
+
+        new.interactions = generate_interactions(new.components, InteractionCoulomb,
+                                                 new.max_memory, new.direct_scf_tol)
+        return new
+
     def reset(self, mol=None):
         '''Reset mol and relevant attributes associated to the old mol object'''
         if mol is not None:
@@ -1885,7 +1985,7 @@ class HF(scf.hf.SCF):
                     self.components[t] = general_scf(mf, charge=charge)
             self.interactions.clear()
             self.interactions.update(generate_interactions(self.components, InteractionCoulomb,
-                                                           self.max_memory))
+                                                           self.max_memory, self.direct_scf_tol))
 
         return self
 

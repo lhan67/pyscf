@@ -1151,6 +1151,8 @@ def get_occ(mf, mo_energy=None, mo_coeff=None):
     mo_occ = numpy.zeros_like(mo_energy)
     nocc = mf.mol.nelectron // 2
     mo_occ[e_idx[:nocc]] = 2
+    if nocc > nmo:
+        raise RuntimeError(f'Failed to assign mo_occ. Nocc ({nocc}) > Nmo ({nmo})')
     if mf.verbose >= logger.INFO and nocc < nmo:
         if e_sort[nocc-1]+1e-3 > e_sort[nocc]:
             logger.warn(mf, 'HOMO %.15g == LUMO %.15g',
@@ -2228,6 +2230,13 @@ This is the Gaussian fit version as described in doi:10.1063/5.0004046.''')
     update_from_chk = update_from_chk_ = update = update_
 
     as_scanner = as_scanner
+
+    def copy(self):
+        '''Avoid sharing scf_summary across copied objects'''
+        new = super().copy()
+        if hasattr(self, 'scf_summary') and isinstance(self.scf_summary, dict):
+            new.scf_summary = dict(self.scf_summary)
+        return new
 
     def reset(self, mol=None):
         '''Reset mol and relevant attributes associated to the old mol object'''

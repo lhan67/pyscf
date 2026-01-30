@@ -5,12 +5,13 @@ Analytic nuclear gradient for constrained nuclear-electronic orbital
 '''
 
 import numpy
+import ctypes
 import warnings
 from scipy.special import erf
 from pyscf import df, gto, lib, neo, scf
 from pyscf.grad import rhf as rhf_grad
 from pyscf.lib import logger
-from pyscf.scf import hf
+from pyscf.scf import hf, _vhf
 from pyscf.scf.jk import get_jk
 from pyscf.dft.numint import eval_ao, eval_rho, _scale_ao
 from pyscf.grad.rks import _d1_dot_
@@ -169,10 +170,39 @@ class ComponentGrad:
     def kernel(self, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         raise AttributeError
 
+def _make_vhfopt(mol, dms):
+    libcvhf = _vhf.libcvhf
+    vhfopt = _vhf._VHFOpt(mol, 'int2e_ip1', 'CVHFgrad_jk_prescreen',
+                          dmcondname=None)
+    ao_loc = mol.ao_loc_nr()
+    nbas = mol.nbas
+    q_cond = numpy.empty((2, nbas, nbas))
+    with mol.with_integral_screen(vhfopt.direct_scf_tol**2):
+        libcvhf.CVHFnr_int2e_pp_q_cond(
+            getattr(libcvhf, mol._add_suffix('int2e_ip1ip2')),
+            lib.c_null_ptr(), q_cond[0].ctypes,
+            ao_loc.ctypes, mol._atm.ctypes, ctypes.c_int(mol.natm),
+            mol._bas.ctypes, ctypes.c_int(nbas), mol._env.ctypes)
+        libcvhf.CVHFnr_int2e_q_cond(
+            getattr(libcvhf, mol._add_suffix('int2e')),
+            lib.c_null_ptr(), q_cond[1].ctypes,
+            ao_loc.ctypes, mol._atm.ctypes, ctypes.c_int(mol.natm),
+            mol._bas.ctypes, ctypes.c_int(nbas), mol._env.ctypes)
+    vhfopt.q_cond = q_cond
+
+    vhfopt._dmcondname = 'CVHFnr_dm_cond1'
+    vhfopt.set_dm(dms, mol._atm, mol._bas, mol._env)
+    vhfopt._dmcondname = None
+    return vhfopt
+
 def grad_pair_int(mol1, mol2, dm1, dm2, charge1, charge2, atmlst):
     de = numpy.zeros((len(atmlst),3))
     aoslices1 = mol1.aoslice_by_atom()
     aoslices2 = mol2.aoslice_by_atom()
+    nao1 = mol1.nao_nr()
+    nao2 = mol2.nao_nr()
+    vhfopt1 = _make_vhfopt(mol1 + mol2, neo.hf._combine_dm(dm1, nao1, dm2, nao2))
+    vhfopt2 = _make_vhfopt(mol2 + mol1, neo.hf._combine_dm(dm2, nao2, dm1, nao1))
     for i0, ia in enumerate(atmlst):
         shl0, shl1, p0, p1 = aoslices1[ia]
         # Derivative w.r.t. mol1
@@ -181,7 +211,7 @@ def grad_pair_int(mol1, mol2, dm1, dm2, charge1, charge2, atmlst):
             v1 = get_jk((mol1, mol1, mol2, mol2),
                         dm2, scripts='ijkl,lk->ij',
                         intor='int2e_ip1', aosym='s2kl', comp=3,
-                        shls_slice=shls_slice)
+                        shls_slice=shls_slice, vhfopt=vhfopt1)
             de[i0] -= 2. * charge1 * charge2 * \
                       numpy.einsum('xij,ij->x', v1, dm1[p0:p1])
         shl0, shl1, p0, p1 = aoslices2[ia]
@@ -191,7 +221,7 @@ def grad_pair_int(mol1, mol2, dm1, dm2, charge1, charge2, atmlst):
             v1 = get_jk((mol2, mol2, mol1, mol1),
                         dm1, scripts='ijkl,lk->ij',
                         intor='int2e_ip1', aosym='s2kl', comp=3,
-                        shls_slice=shls_slice)
+                        shls_slice=shls_slice, vhfopt=vhfopt2)
             de[i0] -= 2. * charge1 * charge2 * \
                       numpy.einsum('xij,ij->x', v1, dm2[p0:p1])
     return de

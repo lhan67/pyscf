@@ -1,6 +1,8 @@
 from pyscf import neo, scf, gto
 from pyscf.tdscf import TDDFT
 from pyscf.neo import cphf
+from pyscf.neo.hf import _combine_dm
+from pyscf.neo.grad import _make_vhfopt
 from pyscf.lib import logger
 from pyscf import lib
 from pyscf.scf.jk import get_jk
@@ -22,6 +24,24 @@ def get_fock_add_cdft(f1n, int1e_r_ao, fac=2.0):
         f_add[t] = numpy.einsum('xij, x->ij', int1e_r_ao[t], f1n[t]) * fac
 
     return f_add
+
+def _build_all_vhfopt(mols, dm_gs_e, dm_gs, dm_z_e, dm_z):
+    vhfopt = {}
+    for t1, mol1 in mols.items():
+        for t2, mol2 in mols.items():
+            if t1 == t2:
+                continue
+            nao1 = mol1.nao_nr()
+            nao2 = mol2.nao_nr()
+            mol = mol1 + mol2
+            if t1 == 'e':
+                dms = _combine_dm((dm_gs_e, dm_z_e), nao1, (dm_gs[t2], dm_z[t2]), nao2)
+            elif t2 == 'e':
+                dms = _combine_dm((dm_gs[t1], dm_z[t1]), nao1, (dm_gs_e, dm_z_e), nao2)
+            else:
+                dms = _combine_dm((dm_gs[t1], dm_z[t1]), nao1, (dm_gs[t2], dm_z[t2]), nao2)
+            vhfopt[f'{t1}-{t2}'] = _make_vhfopt(mol, dms)
+    return vhfopt
 
 def grad_elec_rhf(td_grad, x_y, singlet=True, atmlst=None,
                   max_memory=2000, verbose=logger.INFO):
@@ -278,6 +298,7 @@ def grad_elec_rhf(td_grad, x_y, singlet=True, atmlst=None,
         atmlst = range(mol.natm)
     aoslices = mol.aoslice_by_atom()
     de = numpy.zeros((len(atmlst),3))
+    vhfopt = _build_all_vhfopt(mol.components, dm_gs['e'], dm_gs, dmz1doo, dm_z)
     for k, ka in enumerate(atmlst):
         shl0, shl1, p0, p1 = aoslices[ka]
 
@@ -305,7 +326,7 @@ def grad_elec_rhf(td_grad, x_y, singlet=True, atmlst=None,
                 v1en = get_jk((mol_e, mol_e, mol_n, mol_n),
                               (dm_gs[t1], dm_z[t1]), scripts=['ijkl,lk->ij','ijkl,lk->ij'],
                               intor='int2e_ip1', aosym='s2kl', comp=3,
-                              shls_slice=shls_slice)
+                              shls_slice=shls_slice, vhfopt=vhfopt[f'e-{t1}'])
                 v1en = [_v * charge for _v in v1en]
                 h1ao_e[:,p0:p1] += v1en[0]
                 h1ao_e[:,:,p0:p1] += v1en[0].transpose(0,2,1)
@@ -317,7 +338,8 @@ def grad_elec_rhf(td_grad, x_y, singlet=True, atmlst=None,
                     # derivative w.r.t. nuclear basis center
                     v1ne = get_jk((mol_n, mol_n, mol_e, mol_e),
                                   (dm_gs['e'], dmz1doo), scripts=['ijkl,lk->ij','ijkl,lk->ij'],
-                                  intor='int2e_ip1', aosym='s2kl', comp=3)
+                                  intor='int2e_ip1', aosym='s2kl', comp=3,
+                                  vhfopt=vhfopt[f'{t1}-e'])
                     v1ne = [_v * charge for _v in v1ne]
                     h1ao_n += v1ne[0] + v1ne[0].transpose(0,2,1)
                     z1ao_n += v1ne[1] * 2.0
@@ -327,7 +349,8 @@ def grad_elec_rhf(td_grad, x_y, singlet=True, atmlst=None,
                             mol_n2 = mol.components[t2]
                             v1nn = get_jk((mol_n, mol_n, mol_n2, mol_n2),
                                           (dm_gs[t2], dm_z[t2]), scripts=['ijkl,lk->ij','ijkl,lk->ij'],
-                                          intor='int2e_ip1', aosym='s2kl', comp=3)
+                                          intor='int2e_ip1', aosym='s2kl', comp=3,
+                                          vhfopt=vhfopt[f'{t1}-{t2}'])
                             _charge = charge * mf.components[t2].charge
                             v1nn = [_v * _charge for _v in v1nn]
                             h1ao_n += v1nn[0] + v1nn[0].transpose(0,2,1)
@@ -645,8 +668,8 @@ def grad_elec_uhf(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INF
     as_dm1 = oo0a + oo0b + (dmz1dooa + dmz1doob) * .5
 
     if mf.xc_e.upper() == 'HF':
-        vj, vk = td_grad.get_jk(mol, (oo0a, dmz1dooa+dmz1dooa.T, dmxpya+dmxpya.T, dmxmya-dmxmya.T,
-                                oo0b, dmz1doob+dmz1doob.T, dmxpyb+dmxpyb.T, dmxmyb-dmxmyb.T))
+        vj, vk = td_grad_e.get_jk(mol, (oo0a, dmz1dooa+dmz1dooa.T, dmxpya+dmxpya.T, dmxmya-dmxmya.T,
+                                  oo0b, dmz1doob+dmz1doob.T, dmxpyb+dmxpyb.T, dmxmyb-dmxmyb.T))
         vj = vj.reshape(2,4,3,nao_e,nao_e)
         vk = vk.reshape(2,4,3,nao_e,nao_e)
         veff1a, veff1b = vj[0] + vj[1] - vk
@@ -659,12 +682,12 @@ def grad_elec_uhf(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INF
             vj = vj.reshape(2,4,3,nao_e,nao_e)
             vk = vk.reshape(2,4,3,nao_e,nao_e) * hyb
             if omega != 0:
-                vk += td_grad.get_k(mol, dm, omega=omega).reshape(2,4,3,nao_e,nao_e) * (alpha-hyb)
+                vk += td_grad_e.get_k(mol, dm, omega=omega).reshape(2,4,3,nao_e,nao_e) * (alpha-hyb)
             veff1 = vj[0] + vj[1] - vk
         else:
             dm = (oo0a, dmz1dooa+dmz1dooa.T, dmxpya+dmxpya.T,
                   oo0b, dmz1doob+dmz1doob.T, dmxpyb+dmxpyb.T)
-            vj = td_grad.get_j(mol, dm).reshape(2,3,3,nao_e,nao_e)
+            vj = td_grad_e.get_j(mol, dm).reshape(2,3,3,nao_e,nao_e)
             veff1 = numpy.zeros((2,4,3,nao_e,nao_e))
             veff1[:,:3] = vj[0] + vj[1]
 
@@ -683,6 +706,8 @@ def grad_elec_uhf(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INF
     offsetdic = mol_e.offset_nr_by_atom()
     de = numpy.zeros((len(atmlst),3))
     dm_gs = mf.make_rdm1()
+    dm_e = dm_gs['e'][0] + dm_gs['e'][1]
+    vhfopt = _build_all_vhfopt(mol.components, dm_e, dm_gs, dmz1dooa+dmz1doob, dm_z)
     for k, ka in enumerate(atmlst):
         shl0, shl1, p0, p1 = offsetdic[ka]
 
@@ -714,7 +739,6 @@ def grad_elec_uhf(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INF
         de[k] -= numpy.einsum('xji,ij->x', veff1b[3,:,p0:p1], dmxmyb[:,p0:p1])
 
         z1ao_e = 0.0
-        dm_e = dm_gs['e'][0] + dm_gs['e'][1]
 
         for t1 in mf.components.keys():
             if t1.startswith('n'):
@@ -726,7 +750,7 @@ def grad_elec_uhf(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INF
                 v1en = get_jk((mol_e, mol_e, mol_n, mol_n),
                               (dm_gs[t1], dm_z[t1]), scripts=['ijkl,lk->ij','ijkl,lk->ij'],
                               intor='int2e_ip1', aosym='s2kl', comp=3,
-                              shls_slice=shls_slice)
+                              shls_slice=shls_slice, vhfopt=vhfopt[f'e-{t1}'])
                 v1en = [_v * charge for _v in v1en]
                 h1ao_e[:,p0:p1] += v1en[0]
                 h1ao_e[:,:,p0:p1] += v1en[0].transpose(0,2,1)
@@ -738,7 +762,8 @@ def grad_elec_uhf(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INF
                     # derivative w.r.t. nuclear basis center
                     v1ne = get_jk((mol_n, mol_n, mol_e, mol_e),
                                   (dm_e, dmz1dooa+dmz1doob), scripts=['ijkl,lk->ij','ijkl,lk->ij'],
-                                  intor='int2e_ip1', aosym='s2kl', comp=3)
+                                  intor='int2e_ip1', aosym='s2kl', comp=3,
+                                  vhfopt=vhfopt[f'{t1}-e'])
                     v1ne = [_v * charge for _v in v1ne]
                     h1ao_n += v1ne[0] + v1ne[0].transpose(0,2,1)
                     z1ao_n += v1ne[1]
@@ -748,7 +773,8 @@ def grad_elec_uhf(td_grad, x_y, atmlst=None, max_memory=2000, verbose=logger.INF
                             mol_n2 = mol.components[t2]
                             v1nn = get_jk((mol_n, mol_n, mol_n2, mol_n2),
                                           (dm_gs[t2], dm_z[t2]), scripts=['ijkl,lk->ij','ijkl,lk->ij'],
-                                          intor='int2e_ip1', aosym='s2kl', comp=3)
+                                          intor='int2e_ip1', aosym='s2kl', comp=3,
+                                          vhfopt=vhfopt[f'{t1}-{t2}'])
                             _charge = charge * mf.components[t2].charge
                             v1nn = [_v * _charge for _v in v1nn]
                             h1ao_n += v1nn[0] + v1nn[0].transpose(0,2,1)
