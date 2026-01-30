@@ -329,7 +329,8 @@ class KS(hf.HF):
                     charge = -1.
                 self.components[t] = hf.general_scf(mf, charge=charge)
         self.interactions = hf.generate_interactions(self.components, InteractionCorrelation,
-                                                     self.max_memory, epc=self.epc)
+                                                     self.max_memory, self.direct_scf_tol,
+                                                     epc=self.epc)
         #####
         self._epc_n_types = None
         self._skip_epc = False
@@ -575,7 +576,8 @@ class KS(hf.HF):
                                                nuc_occ_state=comp.nuc_occ_state)
 
         new.interactions = hf.generate_interactions(new.components, InteractionCorrelation,
-                                                    new.max_memory, epc=new.epc)
+                                                    new.max_memory, new.direct_scf_tol,
+                                                    epc=new.epc)
         # properly link to the new one
         if isinstance(new.components['e'], scf.hf.KohnShamDFT):
             new._numint = new.components['e']._numint
@@ -638,7 +640,9 @@ class KS(hf.HF):
             self.interactions.clear()
             self.interactions.update(hf.generate_interactions(self.components,
                                                               InteractionCorrelation,
-                                                              self.max_memory, epc=self.epc))
+                                                              self.max_memory,
+                                                              self.direct_scf_tol,
+                                                              epc=self.epc))
         # EPC grids
         self._epc_n_types = None
         self._skip_epc = False
