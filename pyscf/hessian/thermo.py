@@ -131,8 +131,23 @@ def rotation_const(mass, atom_coords, unit='GHz'):
             raise RuntimeError('Unsupported unit ' + unit)
     return e
 
+def thermo(model, freq, temperature=298.15, pressure=101325, fundamental_frequency_scale_factor=1.0,
+           entropy_method=None, w0=100.0, B_av=None, ZPE_scale_factor=1.0):
+     '''Thermodynamic quantities calculation
 
-def thermo(model, freq, temperature=298.15, pressure=101325):
+    Kwargs:
+        fundamental_frequency_scale_factor (float): Factor used to scale harmonic frequencies to real fundamental frequencies
+        entropy_method: Method used to calculate vibrational entropy
+            None: Entropy contributions from low-frequency modes are calculated using the harmonic oscillator approximation
+            'qRRHO': Entropy contributions from low-frequency modes are calculated using an interpolation between the free rotor and harmonic oscillator
+            (Grimme, Chem. Eur. J. 2012, 18, 9955.)
+        w0 (float): When 'qRRHO' is used, controls the frequency threshold below which a mode is considered to show strong free-rotor behavior
+        B_av: When 'qRRHO' is used, how the lower bound of the free-rotor moment of inertia is determined
+            None: 1e-44 kg*m^2, the default value used in Grimme's original paper
+            'specific': taken as the moment of inertia of the target molecule
+            (float): user-specified value
+        ZPE_scale_factor (float): Factor used to scale the ZPE obtained from the harmonic approximation
+    '''
     mol = model.mol
     atom_coords = mol.atom_coords()
     mass = mol.atom_mass_list(isotope_avg=True)
@@ -198,15 +213,46 @@ def thermo(model, freq, temperature=298.15, pressure=101325):
     # Vibrational part.
     au2hz = (nist.HARTREE2J / (nist.ATOMIC_MASS * nist.BOHR_SI**2))**.5 / (2 * numpy.pi)
     idx = freq.real > 0
-    vib_temperature = freq.real[idx] * au2hz * h / kB
+    freq_hz_zpe = freq.real[idx] * ZPE_scale_factor * au2hz
+    vib_temperature_zpe = freq_hz_zpe * h / kB
+    ZPE = R_Eh * .5 * vib_temperature_zpe.sum()
+    results['ZPE'] = (ZPE, 'Eh')
+
+    freq = freq * fundamental_frequency_scale_factor
+    freq_hz = freq.real[idx] * au2hz
+    vib_temperature = freq_hz * h / kB
     # reduced_temperature
     rt = vib_temperature / max(1e-14, temperature)
     e = numpy.exp(-rt)
 
-    ZPE = R_Eh * .5 * vib_temperature.sum()
-    results['ZPE'] = (ZPE, 'Eh')
+    S_vib_harm = R_Eh * (rt*e/(1-e) - numpy.log(1-e))
+    if entropy_method == "qRRHO":
+        # Grimme's qRRHO for entropy
+        if B_av == None:
+            B_av_val = 1.00e-44
+        elif B_av == "specific":
+            av_roconst_ghz = numpy.mean(rot_const)
+            av_roconst_hz = av_roconst_ghz * 1e9
+            with numpy.errstate(divide='ignore'):
+                av_roconst_s = 1.0 / av_roconst_hz
+            B_av_val = av_roconst_s * h
+        elif isinstance(B_av, (int, float)):
+            B_av_val = float(B_av)
 
-    results['S_vib' ] = (R_Eh * (rt*e/(1-e) - numpy.log(1-e)).sum(), 'Eh/K')
+        mu = h / (8 * numpy.pi**2 * freq_hz)
+        mu_prime = mu * B_av_val / (mu + B_av_val)
+        term = (8 * numpy.pi**3 * mu_prime * kB * temperature) / h**2
+        S_rot_vib = R_Eh * (0.5 + numpy.log(numpy.sqrt(term)))
+        w0_hz = w0 * nist.LIGHT_SPEED_SI * 100
+        w_freq = 1. / (1 + (w0_hz / freq_hz)**4)
+
+        S_vib_final = w_freq * S_vib_harm + (1 - w_freq) * S_rot_vib
+        results['S_vib'] = (S_vib_final.sum(), 'Eh/K')
+    elif entropy_method == None:
+        results['S_vib'] = (S_vib_harm.sum(), 'Eh/K')
+    else:
+        raise NotImplementedError(f"Unsupported entropy_method: {entropy_method}")
+
     results['Cv_vib'] = results['Cp_vib'] = (R_Eh * (e * rt**2/(1-e)**2).sum(), 'Eh/K')
     results['E_vib' ] = results['H_vib' ] = \
             (ZPE + R_Eh * temperature * (rt * e / (1-e)).sum(), 'Eh')
